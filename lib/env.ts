@@ -14,9 +14,11 @@ const Env = z.object({
   GOOGLE_CLIENT_SECRET: z.string().optional(),
   GOOGLE_REDIRECT_URI: z.string().url().optional(),
 
-  // Upstash Redis
-  UPSTASH_REDIS_REST_URL: z.string().url(),
-  UPSTASH_REDIS_REST_TOKEN: z.string().min(1),
+  // Upstash Redis — Marketplace integration uses KV_REST_API_*, direct Upstash uses UPSTASH_REDIS_REST_*
+  UPSTASH_REDIS_REST_URL: z.string().url().optional(),
+  UPSTASH_REDIS_REST_TOKEN: z.string().min(1).optional(),
+  KV_REST_API_URL: z.string().url().optional(),
+  KV_REST_API_TOKEN: z.string().min(1).optional(),
 
   // QStash
   QSTASH_TOKEN: z.string().optional(),
@@ -50,6 +52,19 @@ export function env(): EnvShape {
     cached = parsed.data;
   }
   return cached;
+}
+
+/** Resolve Upstash Redis credentials from either Marketplace (KV_*) or direct Upstash (UPSTASH_*) env vars. */
+export function redisCreds(): { url: string; token: string } {
+  const e = env();
+  const url = e.UPSTASH_REDIS_REST_URL ?? e.KV_REST_API_URL;
+  const token = e.UPSTASH_REDIS_REST_TOKEN ?? e.KV_REST_API_TOKEN;
+  if (!url || !token) {
+    throw new Error(
+      "Missing Redis credentials. Set UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN or KV_REST_API_URL/KV_REST_API_TOKEN.",
+    );
+  }
+  return { url, token };
 }
 
 export function hasGoogleOAuth(): boolean {
