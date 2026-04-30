@@ -41,27 +41,41 @@ export function buildReminderTools(userId: string) {
       }),
       execute: async ({ when, message }) => {
         const fireAt = new Date(when).getTime();
-        if (!Number.isFinite(fireAt)) return { ok: false, error: "Invalid datetime" };
+        if (!Number.isFinite(fireAt)) {
+          console.warn("[reminder] invalid when:", when);
+          return { ok: false, error: `Invalid datetime "${when}". Pass an ISO 8601 string.` };
+        }
         const delaySec = Math.floor((fireAt - Date.now()) / 1000);
-        if (delaySec < 1) return { ok: false, error: "Reminder time is in the past" };
+        if (delaySec < 1) {
+          return { ok: false, error: `Reminder time is in the past (${new Date(fireAt).toISOString()}).` };
+        }
         if (delaySec > 60 * 60 * 24 * 365) return { ok: false, error: "Max 1 year ahead" };
 
         const id = crypto.randomUUID();
         const callbackUrl = `${env().APP_BASE_URL}/api/reminders/fire`;
-        const res = await qstash().publishJSON({
-          url: callbackUrl,
-          body: { userId, id, message },
-          delay: delaySec,
-        });
-        const stored: StoredReminder = {
-          id,
-          message,
-          fireAt,
-          qstashId: res.messageId,
-        };
-        await redis().set(reminderKey(userId, id), stored, { ex: delaySec + 60 });
-        await redis().sadd(reminderListKey(userId), id);
-        return { ok: true, id, fireAt: new Date(fireAt).toISOString() };
+        try {
+          const res = await qstash().publishJSON({
+            url: callbackUrl,
+            body: { userId, id, message },
+            delay: delaySec,
+          });
+          const stored: StoredReminder = {
+            id,
+            message,
+            fireAt,
+            qstashId: res.messageId,
+          };
+          await redis().set(reminderKey(userId, id), stored, { ex: delaySec + 60 });
+          await redis().sadd(reminderListKey(userId), id);
+          console.log("[reminder] scheduled", { userId, id, fireAt: new Date(fireAt).toISOString(), delaySec });
+          return { ok: true, id, fireAt: new Date(fireAt).toISOString() };
+        } catch (err) {
+          console.error("[reminder] qstash/redis failed", err);
+          return {
+            ok: false,
+            error: err instanceof Error ? err.message : "Failed to schedule reminder",
+          };
+        }
       },
     }),
 
