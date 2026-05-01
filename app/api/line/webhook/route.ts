@@ -25,6 +25,7 @@ import { classify, clearPending, getPending } from "@/lib/confirm";
 import { listAccounts } from "@/lib/tools/google-auth";
 import { renderDraftsBlock } from "@/lib/llm/render-drafts";
 import { executePendingAll } from "@/lib/pending-runner";
+import { getRecentImage, setRecentImage } from "@/lib/memory/recent-image";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -185,6 +186,14 @@ async function respondToImage(
   try {
     const { bytes, contentType } = await getMessageContent(messageId);
     imagePart = { type: "image", image: bytes, mediaType: contentType };
+    // Stash for ~30 min so the user can reference it for follow-up actions
+    // ("attach this image to an email", etc).
+    await setRecentImage(userId, {
+      messageId,
+      contentType,
+      sizeBytes: bytes.byteLength,
+      ts: Date.now(),
+    });
   } catch (err) {
     console.warn("[webhook] image fetch failed", err);
     await reply(replyToken, [textMsg("I couldn't load that image — can you resend it?")]);
@@ -224,7 +233,11 @@ async function runAgent(
         .map((a) => `${a.email}${a.email === accounts.activeEmail ? " (active)" : ""}`)
         .join(", ")}.`
     : "";
-  const system = buildSystemPrompt(factsToPromptBlock(facts), profile) + accountsBlock;
+  const recentImg = await getRecentImage(userId);
+  const recentImgBlock = recentImg
+    ? `\n\nA recent image is staged for attachment (type ${recentImg.contentType}, ${(recentImg.sizeBytes / 1024).toFixed(0)} KB, sent ${Math.round((Date.now() - recentImg.ts) / 1000)}s ago). To attach it to an email, set \`attach_recent_image: true\` on draft_email.`
+    : "";
+  const system = buildSystemPrompt(factsToPromptBlock(facts), profile) + accountsBlock + recentImgBlock;
 
   try {
     const result = await generateText({

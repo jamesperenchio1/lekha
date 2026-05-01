@@ -26,6 +26,7 @@ export function renderDraftsBlock(
         body?: string;
         fromEmail?: string;
         attachments?: { fileId: string }[];
+        attach_recent_image?: boolean;
       };
       const lines = [
         "📧 Draft email",
@@ -35,9 +36,14 @@ export function renderDraftsBlock(
       if (args.cc?.length) lines.push(`Cc: ${args.cc.join(", ")}`);
       if (args.bcc?.length) lines.push(`Bcc: ${args.bcc.join(", ")}`);
       lines.push(`Subject: ${args.subject ?? "(missing)"}`);
+      const attBits: string[] = [];
       if (args.attachments?.length) {
-        lines.push(`Attachments: ${args.attachments.length} file(s) from Drive (ids: ${args.attachments.map((a) => a.fileId).join(", ")})`);
+        attBits.push(
+          `${args.attachments.length} from Drive (ids: ${args.attachments.map((a) => a.fileId).join(", ")})`,
+        );
       }
+      if (args.attach_recent_image) attBits.push("the most recent image you sent");
+      if (attBits.length) lines.push(`Attachments: ${attBits.join("; ")}`);
       lines.push("", (args.body ?? "(missing)").trim());
       parts.push(lines.join("\n"));
     } else if (call.toolName === "draft_calendar_event") {

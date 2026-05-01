@@ -4,6 +4,8 @@ import { google } from "googleapis";
 import { withGoogleClient } from "./with-google";
 import { getGoogleClient } from "./google-auth";
 import { appendPending, type SendEmailAction } from "@/lib/confirm";
+import { getRecentImage } from "@/lib/memory/recent-image";
+import { getMessageContent } from "@/lib/line/client";
 
 const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive";
@@ -38,8 +40,32 @@ export function buildEmailTools(userId: string) {
           .max(10)
           .optional()
           .describe("Drive file IDs to attach. Find IDs via drive_search first."),
+        attach_recent_image: z
+          .boolean()
+          .optional()
+          .describe(
+            "Set true to attach the most recent image the user sent in this LINE chat (within ~30 min). Use this when the user says 'attach this image', 'send this photo', etc.",
+          ),
+        attach_recent_image_filename: z
+          .string()
+          .max(100)
+          .optional()
+          .describe("Filename for the recent-image attachment. Defaults to image.jpg/png based on type."),
       }),
-      execute: async ({ to, cc, bcc, subject, body, fromEmail, attachments }) => {
+      execute: async ({
+        to, cc, bcc, subject, body, fromEmail, attachments,
+        attach_recent_image, attach_recent_image_filename,
+      }) => {
+        if (attach_recent_image) {
+          const recent = await getRecentImage(userId);
+          if (!recent) {
+            return {
+              ok: false as const,
+              error:
+                "No recent image found. Ask the user to send the image again, then retry — the bot keeps each image for ~30 min.",
+            };
+          }
+        }
         const action: SendEmailAction = {
           kind: "send_email",
           to,
@@ -49,11 +75,13 @@ export function buildEmailTools(userId: string) {
           body,
           fromEmail,
           attachments,
+          attachRecentImage: attach_recent_image,
+          attachRecentImageFilename: attach_recent_image_filename,
         };
         await appendPending(userId, action);
         return {
           status: "draft_pending_confirmation" as const,
-          draft: { to, cc, bcc, subject, body, fromEmail, attachments },
+          draft: { to, cc, bcc, subject, body, fromEmail, attachments, attach_recent_image },
           instruction:
             "The system will show the user the verbatim draft and ask for YES. Don't paraphrase the body.",
         };
@@ -75,6 +103,21 @@ export async function sendEmail(
   for (const att of args.attachments ?? []) {
     const file = await fetchDriveFile(userId, att.fileId, att.fromEmail);
     fetched.push(file);
+  }
+  if (args.attachRecentImage) {
+    const recent = await getRecentImage(userId);
+    if (!recent) {
+      throw new Error(
+        "Recent image expired before send. Ask the user to resend the image and retry.",
+      );
+    }
+    const { bytes, contentType } = await getMessageContent(recent.messageId);
+    const ext = mimeToExt(contentType);
+    fetched.push({
+      filename: args.attachRecentImageFilename ?? `image${ext}`,
+      mimeType: contentType,
+      bytes,
+    });
   }
 
   const raw = buildRawMime({
@@ -227,4 +270,14 @@ function chunkBase64(s: string): string {
   const out: string[] = [];
   for (let i = 0; i < s.length; i += 76) out.push(s.slice(i, i + 76));
   return out.join("\r\n");
+}
+
+function mimeToExt(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m === "image/jpeg" || m === "image/jpg") return ".jpg";
+  if (m === "image/png") return ".png";
+  if (m === "image/gif") return ".gif";
+  if (m === "image/webp") return ".webp";
+  if (m === "image/heic") return ".heic";
+  return "";
 }
