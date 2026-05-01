@@ -27,14 +27,23 @@ export function chatModel() {
 }
 
 /**
- * Optional fallback used when Gemini returns a quota / rate-limit error.
- * Llama 3.3 70B on Groq is solid at tool use, free tier is ~30 RPM.
+ * Returns ordered list of Groq fallback models to try in sequence.
+ * If one is unavailable / deprecated, the cascade walks to the next.
  * NOTE: text-only — no multimodal. Caller must skip on image/audio/video turns.
- * Returns null when no Groq key is configured.
  */
-export function fallbackChatModel() {
+export function fallbackChatModels() {
   const g = groqClient();
-  return g ? g("llama-3.3-70b-versatile") : null;
+  if (!g) return [];
+  return [
+    g("openai/gpt-oss-120b"),               // Groq's strongest tool-using model right now
+    g("moonshotai/kimi-k2-instruct-0905"), // Kimi K2 — explicitly tuned for agents
+    g("llama-3.3-70b-versatile"),          // Fallback to the proven workhorse
+  ];
+}
+
+/** Back-compat: first available Groq model. */
+export function fallbackChatModel() {
+  return fallbackChatModels()[0] ?? null;
 }
 
 /** Cheap model for background fact extraction + chunk summarization. */

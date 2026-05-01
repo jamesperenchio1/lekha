@@ -14,7 +14,7 @@ import { redis } from "@/lib/memory/redis";
 import { appendTurn, loadHistory, turnCounter } from "@/lib/memory/history";
 import { loadFacts, factsToPromptBlock } from "@/lib/memory/facts";
 import { getOrCreateProfile, isFirstContact } from "@/lib/memory/profile";
-import { chatModel, fallbackChatModel } from "@/lib/llm/provider";
+import { chatModel, fallbackChatModels } from "@/lib/llm/provider";
 import type { LanguageModel } from "ai";
 import { buildSystemPrompt } from "@/lib/llm/prompts";
 import { extractAndMergeFacts } from "@/lib/llm/extract-facts";
@@ -470,10 +470,14 @@ async function runAgent(
       console.warn("[agent] timeout", { seconds: err.seconds });
       return `⏱ Timed out after ${err.seconds}s. Both Gemini and Groq took too long. Try again in a sec.`;
     }
+    if (err instanceof Error && err.name === "AllProvidersFailed") {
+      console.error("[agent] all providers failed");
+      return `🚦 All providers failed:\n\n${err.message}`;
+    }
     const quota = parseQuotaError(err);
     if (quota) {
-      console.warn("[agent] gemini quota/overload — cascade also failed", { retryAfter: quota.retryAfterSec });
-      return `🚦 Gemini overloaded for ~${quota.retryAfterSec}s, Groq fallback also failed.\n\n${verboseError(err)}`;
+      console.warn("[agent] gemini quota/overload (no fallback configured)", { retryAfter: quota.retryAfterSec });
+      return `🚦 Gemini overloaded for ~${quota.retryAfterSec}s.\n\n${verboseError(err)}`;
     }
     console.error("[agent] unhandled", err);
     return `🐛 Unhandled agent error:\n\n${verboseError(err)}`;
@@ -565,39 +569,56 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
     const isTimeout = err instanceof AgentTimeoutError;
     const quota = parseQuotaError(err);
     if (!quota && !isTimeout) throw err;
-    const fallback = fallbackChatModel();
-    if (!fallback || opts.hasMultimodal) throw err;
+    const fallbacks = fallbackChatModels();
+    if (!fallbacks.length || opts.hasMultimodal) throw err;
     console.warn(
       "[agent] cascading to groq",
       isTimeout ? "(gemini timeout)" : `(gemini quota/overload, retry-after ~${quota?.retryAfterSec}s)`,
-      { totalMs: Date.now() - tStart },
+      { totalMs: Date.now() - tStart, fallbackModels: fallbacks.length },
     );
-    const tGroq = Date.now();
-    try {
-      const r = await withTimeout(
-        generateText({
-          model: fallback as LanguageModel,
-          system: opts.system,
-          messages: opts.messages,
-          tools: opts.tools,
-          stopWhen: stepCountIs(4),
-          maxRetries: 0,
-          onStepFinish: (step) => {
-            console.log("[agent] groq step", {
-              ms: Date.now() - tGroq,
-              toolCalls: step.toolCalls.map((c) => c?.toolName),
-              finish: step.finishReason,
-            });
-          },
-        }),
-        45_000,
-      );
-      console.log("[agent] groq done", { ms: Date.now() - tGroq, steps: r.steps.length });
-      return r;
-    } catch (groqErr) {
-      console.error("[agent] groq fallback also failed", groqErr instanceof Error ? `${groqErr.name}: ${groqErr.message}` : groqErr);
-      throw err;
+    const groqErrors: { model: string; error: unknown }[] = [];
+    for (const m of fallbacks) {
+      const tGroq = Date.now();
+      const modelLabel =
+        (m as unknown as { modelId?: string }).modelId ??
+        (m as unknown as { provider?: string }).provider ??
+        "groq";
+      try {
+        const r = await withTimeout(
+          generateText({
+            model: m as LanguageModel,
+            system: opts.system,
+            messages: opts.messages,
+            tools: opts.tools,
+            stopWhen: stepCountIs(4),
+            maxRetries: 0,
+            onStepFinish: (step) => {
+              console.log("[agent] groq step", {
+                model: modelLabel,
+                ms: Date.now() - tGroq,
+                toolCalls: step.toolCalls.map((c) => c?.toolName),
+                finish: step.finishReason,
+              });
+            },
+          }),
+          45_000,
+        );
+        console.log("[agent] groq done", { model: modelLabel, ms: Date.now() - tGroq, steps: r.steps.length });
+        return r;
+      } catch (groqErr) {
+        console.warn("[agent] groq fallback failed", { model: modelLabel, err: groqErr instanceof Error ? `${groqErr.name}: ${groqErr.message}` : groqErr });
+        groqErrors.push({ model: modelLabel, error: groqErr });
+      }
     }
+    // All fallbacks failed — wrap original error with the groq attempts so the
+    // user-facing dump shows what each provider said.
+    const wrapped = new Error(
+      `Both providers failed.\n\nGEMINI:\n${verboseError(err)}\n\nGROQ ATTEMPTS:\n${groqErrors
+        .map((g) => `--- ${g.model} ---\n${verboseError(g.error)}`)
+        .join("\n\n")}`,
+    );
+    wrapped.name = "AllProvidersFailed";
+    throw wrapped;
   }
 }
 
