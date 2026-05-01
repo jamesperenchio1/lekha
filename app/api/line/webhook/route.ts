@@ -480,6 +480,12 @@ async function runAgent(
  * Multimodal turns can't fall back (Groq has no vision), so they re-throw and the
  * caller surfaces a friendly "out of free quota" message.
  */
+/**
+ * Gemini primary (smarter at tool routing), Groq fallback for text-only turns
+ * when Gemini hits a rate limit. `maxRetries: 0` disables the SDK's built-in
+ * exponential backoff so a quota error cascades to Groq in milliseconds, not
+ * after ~10s of silent retries.
+ */
 async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   hasMultimodal: boolean;
   system: string;
@@ -493,6 +499,7 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
       messages: opts.messages,
       tools: opts.tools,
       stopWhen: stepCountIs(8),
+      maxRetries: 0,
       providerOptions: {
         google: {
           safetySettings: [
@@ -509,14 +516,20 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
     if (!quota) throw err;
     const fallback = fallbackChatModel();
     if (!fallback || opts.hasMultimodal) throw err;
-    console.warn("[agent] gemini quota hit — falling back to Groq", { retryAfter: quota.retryAfterSec });
-    return await generateText({
-      model: fallback as LanguageModel,
-      system: opts.system,
-      messages: opts.messages,
-      tools: opts.tools,
-      stopWhen: stepCountIs(8),
-    });
+    console.warn("[agent] gemini quota — instant fallback to groq", { retryAfter: quota.retryAfterSec });
+    try {
+      return await generateText({
+        model: fallback as LanguageModel,
+        system: opts.system,
+        messages: opts.messages,
+        tools: opts.tools,
+        stopWhen: stepCountIs(6),
+        maxRetries: 0,
+      });
+    } catch (groqErr) {
+      console.error("[agent] groq fallback also failed", groqErr instanceof Error ? `${groqErr.name}: ${groqErr.message}` : groqErr);
+      throw err; // surface the original quota message to the user
+    }
   }
 }
 
