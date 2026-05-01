@@ -464,21 +464,52 @@ async function runAgent(
     if (inner instanceof RateLimited) {
       return `I'm being rate-limited. Try again in ~${inner.retryAfterSec}s.`;
     }
-    // Hard-timeout (the model itself was stuck) — distinct, actionable message.
+    // VERBOSE DEBUG MODE — surface the entire error chain to LINE so we can
+    // diagnose remaining failures in production. Revert when stable.
     if (err instanceof AgentTimeoutError) {
       console.warn("[agent] timeout", { seconds: err.seconds });
-      return `That took longer than ${err.seconds}s and I had to bail. Try a simpler version of the request, or try again in a sec.`;
+      return `⏱ Timed out after ${err.seconds}s. Both Gemini and Groq took too long. Try again in a sec.`;
     }
-    // Known Gemini rate-limit / overload errors with a clean retry-after message.
     const quota = parseQuotaError(err);
     if (quota) {
-      console.warn("[agent] gemini quota/overload hit", { retryAfter: quota.retryAfterSec });
-      return `I'm out of free Gemini capacity for the next ~${quota.retryAfterSec}s (and Groq couldn't pick up either). Try again then.`;
+      console.warn("[agent] gemini quota/overload — cascade also failed", { retryAfter: quota.retryAfterSec });
+      return `🚦 Gemini overloaded for ~${quota.retryAfterSec}s, Groq fallback also failed.\n\n${verboseError(err)}`;
     }
     console.error("[agent] unhandled", err);
-    const errClass = err instanceof Error ? ` (${err.name})` : "";
-    return `Something went sideways on my end${errClass}. Try again in a moment?`;
+    return `🐛 Unhandled agent error:\n\n${verboseError(err)}`;
   }
+}
+
+/** Dump everything we can extract from an error — class, message, cause chain, response text. */
+function verboseError(err: unknown): string {
+  const lines: string[] = [];
+  const seen = new Set<unknown>();
+  let cur: unknown = err;
+  let depth = 0;
+  while (cur && typeof cur === "object" && !seen.has(cur) && depth < 4) {
+    seen.add(cur);
+    const e = cur as {
+      name?: string;
+      message?: string;
+      statusCode?: number;
+      responseBody?: string;
+      url?: string;
+      cause?: unknown;
+    };
+    const part = [
+      `${depth === 0 ? "" : "↳ "}${e.name ?? "Error"}: ${e.message ?? "(no message)"}`,
+      e.statusCode ? `  status: ${e.statusCode}` : null,
+      e.url ? `  url: ${e.url}` : null,
+      e.responseBody ? `  body: ${String(e.responseBody).slice(0, 400)}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+    lines.push(part);
+    cur = e.cause;
+    depth++;
+  }
+  const out = lines.join("\n\n");
+  return out.length > 1500 ? `${out.slice(0, 1500)}\n…(truncated)` : out;
 }
 
 /**
@@ -574,9 +605,11 @@ function parseQuotaError(err: unknown): { retryAfterSec: number } | null {
       return String(err);
     }
   })();
-  // Match real quota AND transient overload — both are signals to cascade.
+  // Match real quota AND transient overload AND any AI SDK API call error.
+  // AI_APICallError is the SDK's wrapper for ANY provider HTTP error — almost
+  // always transient at the provider, so cascading to Groq is the right move.
   if (
-    !/quota|rate.?limit|RESOURCE_EXHAUSTED|429|UNAVAILABLE|overloaded|503|INTERNAL|timeout|temporarily/i.test(
+    !/quota|rate.?limit|RESOURCE_EXHAUSTED|429|UNAVAILABLE|overloaded|503|500|502|504|INTERNAL|timeout|temporarily|AI_APICallError|AI_RetryError|fetch failed|ECONN|ENOTFOUND/i.test(
       text,
     )
   ) {
