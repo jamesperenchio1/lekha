@@ -40,9 +40,13 @@ export function fallbackChatModels() {
   const g = groqClient();
   if (!g) return [];
   return [
+    // gpt-oss-120b is the most reliable at JSON tool-calling; with the slim
+    // prompt the request fits under its 8K TPM ceiling.
+    g("openai/gpt-oss-120b"),
+    // Llama 4 has more TPM headroom but occasionally refuses tool use
+    // ("I don't have access to X") when not heavily prompted.
     g("meta-llama/llama-4-maverick-17b-128e-instruct"),
     g("meta-llama/llama-4-scout-17b-16e-instruct"),
-    g("openai/gpt-oss-120b"),
   ];
 }
 
