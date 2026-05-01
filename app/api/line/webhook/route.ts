@@ -250,24 +250,34 @@ async function runAgent(
     if (inner instanceof RateLimited) {
       return `I'm being rate-limited. Try again in ~${inner.retryAfterSec}s.`;
     }
+    // Surface known Gemini rate-limit errors with a clean retry-after message.
+    const quota = parseQuotaError(err);
+    if (quota) {
+      console.warn("[agent] gemini quota hit", { retryAfter: quota.retryAfterSec });
+      return `I'm out of free Gemini quota for the next ~${quota.retryAfterSec}s. Try again then.`;
+    }
     console.error("[agent] unhandled", err);
-    // Debug: include the error message so we can see it in LINE.
-    const detail = errorDetail(err);
-    return `Something went sideways: ${detail}`;
+    return "Something went sideways on my end. Try again in a moment?";
   }
 }
 
-function errorDetail(err: unknown): string {
-  if (err instanceof Error) {
-    const cause = (err as { cause?: unknown }).cause;
-    const causeStr = cause instanceof Error ? ` (cause: ${cause.name}: ${cause.message})` : "";
-    return `${err.name}: ${err.message}${causeStr}`.slice(0, 800);
-  }
-  try {
-    return JSON.stringify(err).slice(0, 800);
-  } catch {
-    return String(err).slice(0, 800);
-  }
+function parseQuotaError(err: unknown): { retryAfterSec: number } | null {
+  const text = (() => {
+    if (err instanceof Error) {
+      const cause = (err as { cause?: unknown }).cause;
+      const causeMsg = cause instanceof Error ? cause.message : "";
+      return `${err.name} ${err.message} ${causeMsg}`;
+    }
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return String(err);
+    }
+  })();
+  if (!/quota|rate.?limit|RESOURCE_EXHAUSTED|429/i.test(text)) return null;
+  const m = text.match(/retry in (\d+(?:\.\d+)?)s/i);
+  const retryAfterSec = m ? Math.ceil(parseFloat(m[1]!)) : 60;
+  return { retryAfterSec };
 }
 
 function unwrap(err: unknown): unknown {
