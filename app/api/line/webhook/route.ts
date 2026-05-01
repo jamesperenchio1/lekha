@@ -21,9 +21,10 @@ import { toolsForUser } from "@/lib/tools";
 import { GoogleAuthRequired, NeedsConfirmation, RateLimited } from "@/lib/errors";
 import { buildConnectUrl } from "@/lib/tools/google-auth";
 import { checkRateLimit } from "@/lib/ratelimit";
-import { classify, clearPending, getPending, type PendingAction } from "@/lib/confirm";
-import { sendEmail } from "@/lib/tools/email";
-import { createCalendarEvent } from "@/lib/tools/calendar";
+import { classify, clearPending, getPending } from "@/lib/confirm";
+import { listAccounts } from "@/lib/tools/google-auth";
+import { renderDraftsBlock } from "@/lib/llm/render-drafts";
+import { executePending } from "@/lib/pending-runner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -215,7 +216,13 @@ async function runAgent(
   facts: Awaited<ReturnType<typeof loadFacts>>,
   messages: ModelMessage[],
 ): Promise<string> {
-  const system = buildSystemPrompt(factsToPromptBlock(facts), profile);
+  const accounts = await listAccounts(userId);
+  const accountsBlock = accounts.accounts.length
+    ? `\n\nConnected Google accounts: ${accounts.accounts
+        .map((a) => `${a.email}${a.email === accounts.activeEmail ? " (active)" : ""}`)
+        .join(", ")}.`
+    : "";
+  const system = buildSystemPrompt(factsToPromptBlock(facts), profile) + accountsBlock;
 
   try {
     const result = await generateText({
@@ -223,7 +230,7 @@ async function runAgent(
       system,
       messages,
       tools: toolsForUser(userId),
-      stopWhen: stepCountIs(5),
+      stopWhen: stepCountIs(8),
       providerOptions: {
         google: {
           safetySettings: [
@@ -235,8 +242,24 @@ async function runAgent(
         },
       },
     });
-    const out = result.text?.trim();
-    return out && out.length > 0 ? out : "(…)";
+
+    // Collect tool calls across steps for canonical draft rendering.
+    const allCalls: { toolName: string; input: unknown }[] = [];
+    for (const step of result.steps) {
+      for (const c of step.toolCalls) {
+        if (!c) continue;
+        allCalls.push({ toolName: c.toolName, input: c.input });
+      }
+    }
+    const draftBlock = renderDraftsBlock(allCalls, accounts.activeEmail);
+
+    const modelText = result.text?.trim() ?? "";
+    if (draftBlock) {
+      // Verbatim draft is the source of truth. Keep model intro short, append draft.
+      const intro = modelText.length > 0 && modelText.length < 240 ? `${modelText}\n\n` : "";
+      return `${intro}${draftBlock}`;
+    }
+    return modelText.length > 0 ? modelText : "(…)";
   } catch (err) {
     // Tools throw typed errors when they need user input. Translate them to chat.
     const inner = unwrap(err);
@@ -295,36 +318,6 @@ function unwrap(err: unknown): unknown {
     cur = next;
   }
   return err;
-}
-
-async function executePending(userId: string, action: PendingAction): Promise<string> {
-  if (action.kind === "send_email") {
-    try {
-      await sendEmail(userId, action);
-      return `✅ Sent to ${action.to}.`;
-    } catch (err) {
-      const e = unwrap(err);
-      if (e instanceof GoogleAuthRequired) {
-        return `I need Google access first. Connect here:\n${buildConnectUrl(userId)}`;
-      }
-      console.error("[send] failed", err);
-      return "I couldn't send that. Want me to try again?";
-    }
-  }
-  if (action.kind === "create_calendar_event") {
-    try {
-      const r = await createCalendarEvent(userId, action);
-      return r.htmlLink ? `✅ Added to your calendar:\n${r.htmlLink}` : "✅ Added to your calendar.";
-    } catch (err) {
-      const e = unwrap(err);
-      if (e instanceof GoogleAuthRequired) {
-        return `I need Google access first. Connect here:\n${buildConnectUrl(userId)}`;
-      }
-      console.error("[calendar] failed", err);
-      return "I couldn't add that. Want me to try again?";
-    }
-  }
-  return "Done.";
 }
 
 async function maybeExtractFacts(userId: string): Promise<void> {

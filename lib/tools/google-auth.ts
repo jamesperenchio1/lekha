@@ -10,16 +10,29 @@ export const SCOPES = [
   "profile",
   "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/drive",
 ];
 
 type StoredTokens = {
   access_token: string;
   refresh_token: string;
-  expiry_date: number; // ms
+  expiry_date: number;
   scope: string;
 };
 
-const tokensKey = (userId: string) => `google:tokens:${userId}`;
+export type Account = {
+  email: string;
+  addedAt: number;
+};
+
+type AccountsBlob = {
+  accounts: Account[];
+  activeEmail: string | null;
+};
+
+const accountsKey = (userId: string) => `google:accounts:${userId}`;
+const tokensKey = (userId: string, email: string) => `google:tokens:${userId}:${email}`;
+const legacyTokensKey = (userId: string) => `google:tokens:${userId}`; // pre-multi-account
 const stateKey = (nonce: string) => `oauth:state:${nonce}`;
 
 function oauth2Client() {
@@ -30,7 +43,7 @@ function oauth2Client() {
 
 /** Build a signed connect-link the user can open from LINE. */
 export function buildConnectUrl(userId: string): string {
-  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 min
+  const expiresAt = Date.now() + 10 * 60 * 1000;
   const payload = `${userId}.${expiresAt}`;
   const sig = hmac(payload, env().OAUTH_STATE_SECRET);
   const token = Buffer.from(`${payload}.${sig}`, "utf8").toString("base64url");
@@ -50,60 +63,157 @@ export function verifyConnectToken(token: string): string {
   return userId;
 }
 
-/** Generate the Google consent URL for this user. Stores a server-side nonce so we can verify the callback. */
+/** Generate the Google consent URL for this user. Stores a server-side nonce. */
 export async function startOAuth(userId: string): Promise<string> {
   const client = oauth2Client();
   const nonce = crypto.randomUUID();
   await redis().set(stateKey(nonce), { userId }, { ex: 600 });
   return client.generateAuthUrl({
     access_type: "offline",
-    prompt: "consent", // force a refresh_token
+    prompt: "consent",
     scope: SCOPES,
     state: nonce,
     include_granted_scopes: true,
   });
 }
 
-/** Exchange an OAuth callback code → store encrypted tokens. Returns the userId. */
-export async function completeOAuth(code: string, state: string): Promise<string> {
+/** Exchange an OAuth callback code → store encrypted tokens keyed by email.
+ * Returns { userId, email } so the caller can notify and resume. */
+export async function completeOAuth(
+  code: string,
+  state: string,
+): Promise<{ userId: string; email: string }> {
   const stored = await redis().get<{ userId: string }>(stateKey(state));
   if (!stored) throw new Error("invalid or expired state");
   await redis().del(stateKey(state));
   const client = oauth2Client();
   const { tokens } = await client.getToken(code);
   if (!tokens.refresh_token) {
-    throw new Error("Google did not return a refresh token (was the user already connected? revoke and retry)");
+    throw new Error(
+      "Google did not return a refresh token. If you've already connected this account, revoke it at https://myaccount.google.com/permissions and retry.",
+    );
   }
+
+  // Discover which email this token belongs to.
+  client.setCredentials(tokens);
+  const oauth2 = google.oauth2({ version: "v2", auth: client });
+  const profile = await oauth2.userinfo.get();
+  const email = profile.data.email;
+  if (!email) throw new Error("Google did not return an email");
+
   const toStore: StoredTokens = {
     access_token: tokens.access_token ?? "",
     refresh_token: tokens.refresh_token,
     expiry_date: tokens.expiry_date ?? Date.now() + 50 * 60 * 1000,
     scope: tokens.scope ?? SCOPES.join(" "),
   };
-  await redis().set(tokensKey(stored.userId), encrypt(JSON.stringify(toStore)));
-  return stored.userId;
+  await redis().set(tokensKey(stored.userId, email), encrypt(JSON.stringify(toStore)));
+  await addAccount(stored.userId, email, /*activate*/ true);
+  return { userId: stored.userId, email };
+}
+
+async function loadAccounts(userId: string): Promise<AccountsBlob> {
+  const blob = await redis().get<AccountsBlob>(accountsKey(userId));
+  if (blob && blob.accounts) return blob;
+
+  // Legacy migration: if there are tokens at the old key, treat them as the
+  // primary account once we discover the email.
+  const legacy = await redis().get<string>(legacyTokensKey(userId));
+  if (legacy) {
+    try {
+      const tokens = JSON.parse(decrypt(legacy)) as StoredTokens;
+      const client = oauth2Client();
+      client.setCredentials(tokens);
+      const oauth2 = google.oauth2({ version: "v2", auth: client });
+      const profile = await oauth2.userinfo.get();
+      const email = profile.data.email;
+      if (email) {
+        await redis().set(tokensKey(userId, email), legacy);
+        await redis().del(legacyTokensKey(userId));
+        const migrated: AccountsBlob = {
+          accounts: [{ email, addedAt: Date.now() }],
+          activeEmail: email,
+        };
+        await redis().set(accountsKey(userId), migrated);
+        return migrated;
+      }
+    } catch {
+      // ignore; treat as no accounts
+    }
+  }
+
+  return { accounts: [], activeEmail: null };
+}
+
+async function saveAccounts(userId: string, blob: AccountsBlob): Promise<void> {
+  await redis().set(accountsKey(userId), blob);
+}
+
+async function addAccount(userId: string, email: string, activate: boolean): Promise<void> {
+  const blob = await loadAccounts(userId);
+  if (!blob.accounts.some((a) => a.email === email)) {
+    blob.accounts.push({ email, addedAt: Date.now() });
+  }
+  if (activate || !blob.activeEmail) blob.activeEmail = email;
+  await saveAccounts(userId, blob);
+}
+
+export async function listAccounts(userId: string): Promise<{
+  accounts: Account[];
+  activeEmail: string | null;
+}> {
+  return loadAccounts(userId);
+}
+
+export async function setActiveAccount(userId: string, email: string): Promise<boolean> {
+  const blob = await loadAccounts(userId);
+  if (!blob.accounts.some((a) => a.email === email)) return false;
+  blob.activeEmail = email;
+  await saveAccounts(userId, blob);
+  return true;
+}
+
+export async function removeAccount(userId: string, email: string): Promise<boolean> {
+  const blob = await loadAccounts(userId);
+  const before = blob.accounts.length;
+  blob.accounts = blob.accounts.filter((a) => a.email !== email);
+  if (blob.activeEmail === email) {
+    blob.activeEmail = blob.accounts[0]?.email ?? null;
+  }
+  await saveAccounts(userId, blob);
+  await redis().del(tokensKey(userId, email));
+  return blob.accounts.length !== before;
 }
 
 export async function hasGoogleConnection(userId: string): Promise<boolean> {
-  return (await redis().exists(tokensKey(userId))) === 1;
+  const blob = await loadAccounts(userId);
+  return blob.accounts.length > 0 && blob.activeEmail !== null;
 }
 
 /**
- * Get an OAuth2 client authorized for this user, refreshing if needed.
- * Throws GoogleAuthRequired if the user hasn't connected yet.
+ * Get an OAuth2 client for a specific account (or the active one), refreshing if needed.
+ * Throws GoogleAuthRequired if no matching account is connected, or if the stored
+ * token is missing scopes the caller will need (forces a re-consent).
  */
-export async function getGoogleClient(userId: string) {
-  const blob = await redis().get<string>(tokensKey(userId));
-  if (!blob) throw new GoogleAuthRequired(SCOPES);
-  const tokens = JSON.parse(decrypt(blob)) as StoredTokens;
+export async function getGoogleClient(userId: string, email?: string, requiredScopes: string[] = []) {
+  const blob = await loadAccounts(userId);
+  const target = email ?? blob.activeEmail;
+  if (!target || !blob.accounts.some((a) => a.email === target)) {
+    throw new GoogleAuthRequired(SCOPES);
+  }
+  const stored = await redis().get<string>(tokensKey(userId, target));
+  if (!stored) throw new GoogleAuthRequired(SCOPES);
+  const tokens = JSON.parse(decrypt(stored)) as StoredTokens;
+  if (requiredScopes.length) {
+    const grantedScopes = new Set((tokens.scope ?? "").split(/\s+/).filter(Boolean));
+    const missing = requiredScopes.filter((s) => !grantedScopes.has(s));
+    if (missing.length) {
+      console.warn("[google-auth] missing scopes for", target, missing);
+      throw new GoogleAuthRequired(SCOPES);
+    }
+  }
   const client = oauth2Client();
-  client.setCredentials({
-    access_token: tokens.access_token,
-    refresh_token: tokens.refresh_token,
-    expiry_date: tokens.expiry_date,
-    scope: tokens.scope,
-  });
-  // Persist any refreshed tokens back to Redis.
+  client.setCredentials(tokens);
   client.on("tokens", async (newTokens) => {
     const merged: StoredTokens = {
       access_token: newTokens.access_token ?? tokens.access_token,
@@ -111,7 +221,7 @@ export async function getGoogleClient(userId: string) {
       expiry_date: newTokens.expiry_date ?? tokens.expiry_date,
       scope: newTokens.scope ?? tokens.scope,
     };
-    await redis().set(tokensKey(userId), encrypt(JSON.stringify(merged)));
+    await redis().set(tokensKey(userId, target), encrypt(JSON.stringify(merged)));
   });
-  return client;
+  return { client, email: target };
 }

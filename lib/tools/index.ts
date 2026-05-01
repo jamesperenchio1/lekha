@@ -3,6 +3,8 @@ import { buildWebSearchTool } from "./web-search";
 import { buildMemoryTools } from "./memory";
 import { buildEmailTools } from "./email";
 import { buildCalendarTools } from "./calendar";
+import { buildDriveTools } from "./drive";
+import { buildGoogleAccountTools } from "./google-accounts";
 import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 
 /**
@@ -16,5 +18,7 @@ export function toolsForUser(userId: string) {
     ...buildMemoryTools(userId),
     ...(hasGoogleOAuth() ? buildEmailTools(userId) : {}),
     ...(hasGoogleOAuth() ? buildCalendarTools(userId) : {}),
+    ...(hasGoogleOAuth() ? buildDriveTools(userId) : {}),
+    ...(hasGoogleOAuth() ? buildGoogleAccountTools(userId) : {}),
   };
 }

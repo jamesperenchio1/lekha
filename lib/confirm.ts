@@ -2,22 +2,26 @@ import { redis } from "@/lib/memory/redis";
 
 const TTL_SEC = 5 * 60;
 
-export type PendingAction =
-  | {
-      kind: "send_email";
-      to: string;
-      subject: string;
-      body: string;
-    }
-  | {
-      kind: "create_calendar_event";
-      summary: string;
-      startISO: string;
-      endISO: string;
-      description?: string;
-      attendees?: string[];
-      location?: string;
-    };
+export type SendEmailAction = {
+  kind: "send_email";
+  to: string[];
+  subject: string;
+  body: string;
+  fromEmail?: string; // which connected Google account to send from
+};
+
+export type CreateCalendarEventAction = {
+  kind: "create_calendar_event";
+  summary: string;
+  startISO: string;
+  endISO: string;
+  description?: string;
+  attendees?: string[];
+  location?: string;
+  fromEmail?: string;
+};
+
+export type PendingAction = SendEmailAction | CreateCalendarEventAction;
 
 const key = (userId: string) => `pending:${userId}`;
 
@@ -34,7 +38,7 @@ export async function clearPending(userId: string): Promise<void> {
 }
 
 const AFFIRMATIVE = new Set([
-  "yes", "y", "yeah", "yep", "yup", "sure", "send", "send it", "do it",
+  "yes", "y", "yeah", "yep", "yup", "sure", "send", "send it", "send them", "do it",
   "go", "go ahead", "confirm", "confirmed", "ok", "okay", "k", "kk",
   "ครับ", "ค่ะ", "ใช่", "ส่ง", "ส่งเลย",
 ]);

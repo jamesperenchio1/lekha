@@ -1,6 +1,8 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { completeOAuth } from "@/lib/tools/google-auth";
 import { push, text as textMsg } from "@/lib/line/client";
+import { clearPending, getPending } from "@/lib/confirm";
+import { executePending } from "@/lib/pending-runner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,18 +20,46 @@ export async function GET(req: NextRequest) {
     return htmlPage("Missing code or state. Try the connect link again.");
   }
 
-  let userId: string;
+  let result: { userId: string; email: string };
   try {
-    userId = await completeOAuth(code, state);
+    result = await completeOAuth(code, state);
   } catch (err) {
     console.error("[oauth] callback failed", err);
-    return htmlPage("Couldn't complete the connection. Ask the bot for a new link and try again.");
+    return htmlPage(
+      `Couldn't complete the connection. ${err instanceof Error ? err.message : ""}`,
+    );
+  }
+  const { userId, email } = result;
+
+  // If the user was waiting on this exact connection (e.g. to send an email),
+  // execute the pending action now and push the result back to LINE.
+  let resumed = false;
+  try {
+    const pending = await getPending(userId);
+    if (pending) {
+      const replyText = await executePending(userId, pending);
+      await clearPending(userId);
+      await push(userId, [textMsg(replyText)]);
+      resumed = true;
+    }
+  } catch (err) {
+    console.warn("[oauth] auto-resume failed", err);
   }
 
-  // Best-effort LINE push so they know to switch back to the chat.
-  push(userId, [textMsg("✅ Google connected. Try your last request again!")]).catch(() => {});
+  // Always nudge them back to LINE with confirmation of which account is now active.
+  push(userId, [
+    textMsg(
+      resumed
+        ? `(Connected ${email} — picked up your last request automatically.)`
+        : `✅ Connected ${email}. You can switch accounts anytime by saying "use my other Google account".`,
+    ),
+  ]).catch(() => {});
 
-  return htmlPage("✅ Connected! Return to LINE and try your request again.");
+  return htmlPage(
+    resumed
+      ? `✅ Connected ${email}. I picked up your request automatically — head back to LINE.`
+      : `✅ Connected ${email}. Return to LINE and try your request again.`,
+  );
 }
 
 function htmlPage(body: string) {
