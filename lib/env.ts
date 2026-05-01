@@ -28,6 +28,9 @@ const Env = z.object({
   // Tavily
   TAVILY_API_KEY: z.string().optional(),
 
+  // Groq (optional fallback when Gemini hits quota)
+  GROQ_API_KEY: z.string().optional(),
+
   // Crypto
   TOKEN_ENCRYPTION_KEY: z.string().regex(/^[0-9a-f]{64}$/, "must be 64 hex chars"),
   OAUTH_STATE_SECRET: z.string().min(32),

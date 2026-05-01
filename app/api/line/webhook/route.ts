@@ -14,7 +14,8 @@ import { redis } from "@/lib/memory/redis";
 import { appendTurn, loadHistory, turnCounter } from "@/lib/memory/history";
 import { loadFacts, factsToPromptBlock } from "@/lib/memory/facts";
 import { getOrCreateProfile, isFirstContact } from "@/lib/memory/profile";
-import { chatModel } from "@/lib/llm/provider";
+import { chatModel, fallbackChatModel } from "@/lib/llm/provider";
+import type { LanguageModel } from "ai";
 import { buildSystemPrompt } from "@/lib/llm/prompts";
 import { extractAndMergeFacts } from "@/lib/llm/extract-facts";
 import { toolsForUser } from "@/lib/tools";
@@ -376,23 +377,24 @@ async function runAgent(
     accountsBlock +
     recentBlock;
 
+  // Detect whether the conversation has a multimodal user turn (image/audio/video/file part).
+  // If so, the Groq fallback (text-only) can't service it — Gemini-only.
+  const hasMultimodal = messages.some(
+    (m) =>
+      Array.isArray(m.content) &&
+      m.content.some((p) => {
+        if (typeof p !== "object" || !p) return false;
+        const t = (p as { type?: string }).type;
+        return t === "image" || t === "file";
+      }),
+  );
+
   try {
-    const result = await generateText({
-      model: chatModel(),
+    const result = await runWithCascade({
+      hasMultimodal,
       system,
       messages,
       tools: toolsForUser(userId),
-      stopWhen: stepCountIs(8),
-      providerOptions: {
-        google: {
-          safetySettings: [
-            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-          ],
-        },
-      },
     });
 
     // Collect tool calls + outputs across steps.
@@ -470,6 +472,51 @@ async function runAgent(
     }
     console.error("[agent] unhandled", err);
     return "Something went sideways on my end. Try again in a moment?";
+  }
+}
+
+/**
+ * Try Gemini first; on quota error fall back to Groq for text-only conversations.
+ * Multimodal turns can't fall back (Groq has no vision), so they re-throw and the
+ * caller surfaces a friendly "out of free quota" message.
+ */
+async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
+  hasMultimodal: boolean;
+  system: string;
+  messages: ModelMessage[];
+  tools: T;
+}) {
+  try {
+    return await generateText({
+      model: chatModel(),
+      system: opts.system,
+      messages: opts.messages,
+      tools: opts.tools,
+      stopWhen: stepCountIs(8),
+      providerOptions: {
+        google: {
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+          ],
+        },
+      },
+    });
+  } catch (err) {
+    const quota = parseQuotaError(err);
+    if (!quota) throw err;
+    const fallback = fallbackChatModel();
+    if (!fallback || opts.hasMultimodal) throw err;
+    console.warn("[agent] gemini quota hit — falling back to Groq", { retryAfter: quota.retryAfterSec });
+    return await generateText({
+      model: fallback as LanguageModel,
+      system: opts.system,
+      messages: opts.messages,
+      tools: opts.tools,
+      stopWhen: stepCountIs(8),
+    });
   }
 }
 
