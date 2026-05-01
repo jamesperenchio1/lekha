@@ -11,9 +11,9 @@ export type SendEmailAction = {
   body: string;
   fromEmail?: string;
   attachments?: { fileId: string; fromEmail?: string }[];
-  /** Attach the most recent image the user sent in this LINE chat. */
-  attachRecentImage?: boolean;
-  attachRecentImageFilename?: string;
+  /** Attach the most recent media file (image/video/audio/file) the user sent in LINE. */
+  attachRecentMedia?: boolean;
+  attachRecentMediaFilename?: string;
 };
 
 export type CreateCalendarEventAction = {

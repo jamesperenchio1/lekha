@@ -19,6 +19,27 @@ const ImageMessage = z.object({
   contentProvider: z.object({ type: z.string() }).optional(),
 });
 
+const VideoMessage = z.object({
+  type: z.literal("video"),
+  id: z.string(),
+  duration: z.number().optional(),
+  contentProvider: z.object({ type: z.string() }).optional(),
+});
+
+const AudioMessage = z.object({
+  type: z.literal("audio"),
+  id: z.string(),
+  duration: z.number().optional(),
+  contentProvider: z.object({ type: z.string() }).optional(),
+});
+
+const FileMessage = z.object({
+  type: z.literal("file"),
+  id: z.string(),
+  fileName: z.string().optional(),
+  fileSize: z.number().optional(),
+});
+
 const StickerMessage = z.object({
   type: z.literal("sticker"),
   id: z.string(),
@@ -31,7 +52,15 @@ const OtherMessage = z.object({
   id: z.string().optional(),
 });
 
-const Message = z.union([TextMessage, ImageMessage, StickerMessage, OtherMessage]);
+const Message = z.union([
+  TextMessage,
+  ImageMessage,
+  VideoMessage,
+  AudioMessage,
+  FileMessage,
+  StickerMessage,
+  OtherMessage,
+]);
 
 export const MessageEvent = z.object({
   type: z.literal("message"),

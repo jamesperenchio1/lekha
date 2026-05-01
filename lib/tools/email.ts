@@ -4,7 +4,7 @@ import { google } from "googleapis";
 import { withGoogleClient } from "./with-google";
 import { getGoogleClient } from "./google-auth";
 import { appendPending, type SendEmailAction } from "@/lib/confirm";
-import { getRecentImage } from "@/lib/memory/recent-image";
+import { getRecentMedia } from "@/lib/memory/recent-media";
 import { getMessageContent } from "@/lib/line/client";
 
 const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send";
@@ -14,7 +14,7 @@ export function buildEmailTools(userId: string) {
   return {
     draft_email: tool({
       description:
-        "Draft an email to send from one of the user's connected Gmail accounts. Does NOT send — appends to a pending queue and the user must reply YES. Pass an array for `to`, `cc`, `bcc` to send to multiple recipients in ONE call. To attach Drive files, pass their fileIds in `attachments` (the system fetches the bytes at send time).",
+        "Draft an email to send from one of the user's connected Gmail accounts. Does NOT send — appends to the pending confirm queue. Pass arrays for to/cc/bcc. Attach Drive files via `attachments: [{fileId}]`. Attach a file the user just sent in LINE (image, video, audio, or document) via `attach_recent_media: true`.",
       inputSchema: z.object({
         to: z.array(z.string().email()).min(1).max(50),
         cc: z.array(z.string().email()).max(50).optional(),
@@ -30,39 +30,37 @@ export function buildEmailTools(userId: string) {
           .array(
             z.object({
               fileId: z.string().min(1),
-              fromEmail: z
-                .string()
-                .email()
-                .optional()
-                .describe("Which connected Google account owns the Drive file. Omit for active."),
+              fromEmail: z.string().email().optional(),
             }),
           )
           .max(10)
           .optional()
           .describe("Drive file IDs to attach. Find IDs via drive_search first."),
-        attach_recent_image: z
+        attach_recent_media: z
           .boolean()
           .optional()
           .describe(
-            "Set true to attach the most recent image the user sent in this LINE chat (within ~30 min). Use this when the user says 'attach this image', 'send this photo', etc.",
+            "Set true to attach whatever the user most recently sent in LINE (image / video / audio / document). The system kept it for ~30 min after they sent it.",
           ),
-        attach_recent_image_filename: z
+        attach_recent_media_filename: z
           .string()
-          .max(100)
+          .max(120)
           .optional()
-          .describe("Filename for the recent-image attachment. Defaults to image.jpg/png based on type."),
+          .describe(
+            "Filename override for the staged LINE media. Defaults to its original name (or image.jpg / video.mp4 / etc).",
+          ),
       }),
       execute: async ({
         to, cc, bcc, subject, body, fromEmail, attachments,
-        attach_recent_image, attach_recent_image_filename,
+        attach_recent_media, attach_recent_media_filename,
       }) => {
-        if (attach_recent_image) {
-          const recent = await getRecentImage(userId);
+        if (attach_recent_media) {
+          const recent = await getRecentMedia(userId);
           if (!recent) {
             return {
               ok: false as const,
               error:
-                "No recent image found. Ask the user to send the image again, then retry — the bot keeps each image for ~30 min.",
+                "No recent LINE media is staged. Ask the user to (re)send the file in LINE; I keep each one for ~30 min.",
             };
           }
         }
@@ -75,22 +73,22 @@ export function buildEmailTools(userId: string) {
           body,
           fromEmail,
           attachments,
-          attachRecentImage: attach_recent_image,
-          attachRecentImageFilename: attach_recent_image_filename,
+          attachRecentMedia: attach_recent_media,
+          attachRecentMediaFilename: attach_recent_media_filename,
         };
         await appendPending(userId, action);
         return {
           status: "draft_pending_confirmation" as const,
-          draft: { to, cc, bcc, subject, body, fromEmail, attachments, attach_recent_image },
+          draft: { to, cc, bcc, subject, body, fromEmail, attachments, attach_recent_media },
           instruction:
-            "The system will show the user the verbatim draft and ask for YES. Don't paraphrase the body.",
+            "The system shows the verbatim draft to the user. Don't paraphrase the body.",
         };
       },
     }),
   };
 }
 
-/** Actually send a previously-confirmed email. Fetches Drive attachments at send time. */
+/** Actually send a previously-confirmed email. Fetches Drive + LINE media at send time. */
 export async function sendEmail(
   userId: string,
   args: SendEmailAction,
@@ -98,26 +96,23 @@ export async function sendEmail(
   const { client, email: from } = await getGoogleClient(userId, args.fromEmail, [GMAIL_SCOPE]);
   const gmail = google.gmail({ version: "v1", auth: client });
 
-  // Fetch attachments (each may use a different connected account).
   const fetched: FetchedAttachment[] = [];
   for (const att of args.attachments ?? []) {
-    const file = await fetchDriveFile(userId, att.fileId, att.fromEmail);
-    fetched.push(file);
+    fetched.push(await fetchDriveFile(userId, att.fileId, att.fromEmail));
   }
-  if (args.attachRecentImage) {
-    const recent = await getRecentImage(userId);
+  if (args.attachRecentMedia) {
+    const recent = await getRecentMedia(userId);
     if (!recent) {
       throw new Error(
-        "Recent image expired before send. Ask the user to resend the image and retry.",
+        "Recent LINE media expired before send. Ask the user to resend the file and retry.",
       );
     }
     const { bytes, contentType } = await getMessageContent(recent.messageId);
-    const ext = mimeToExt(contentType);
-    fetched.push({
-      filename: args.attachRecentImageFilename ?? `image${ext}`,
-      mimeType: contentType,
-      bytes,
-    });
+    const filename =
+      args.attachRecentMediaFilename ??
+      recent.fileName ??
+      defaultFilename(recent.kind, contentType);
+    fetched.push({ filename, mimeType: contentType, bytes });
   }
 
   const raw = buildRawMime({
@@ -130,10 +125,7 @@ export async function sendEmail(
     attachments: fetched,
   });
 
-  await gmail.users.messages.send({
-    userId: "me",
-    requestBody: { raw },
-  });
+  await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
   return { from };
 }
 
@@ -154,7 +146,6 @@ async function fetchDriveFile(
     const name = meta.data.name ?? `file-${fileId}`;
     const mime = meta.data.mimeType ?? "application/octet-stream";
 
-    // Google-native files (Docs/Sheets/Slides) must be EXPORTED to a real format.
     const exportMap: Record<string, { mime: string; ext: string }> = {
       "application/vnd.google-apps.document": {
         mime: "application/pdf",
@@ -169,7 +160,6 @@ async function fetchDriveFile(
         ext: ".pptx",
       },
     };
-
     if (exportMap[mime]) {
       const exp = exportMap[mime]!;
       const r = await drive.files.export(
@@ -182,7 +172,6 @@ async function fetchDriveFile(
         bytes: new Uint8Array(r.data as ArrayBuffer),
       };
     }
-
     const r = await drive.files.get(
       { fileId, alt: "media" },
       { responseType: "arraybuffer" },
@@ -235,9 +224,7 @@ function buildRawMime(opts: {
 
   for (const att of opts.attachments) {
     parts.push(`--${boundary}`);
-    parts.push(
-      `Content-Type: ${att.mimeType}; name="${escapeMimeHeaderValue(att.filename)}"`,
-    );
+    parts.push(`Content-Type: ${att.mimeType}; name="${escapeMimeHeaderValue(att.filename)}"`);
     parts.push("Content-Transfer-Encoding: base64");
     parts.push(
       `Content-Disposition: attachment; filename="${escapeMimeHeaderValue(att.filename)}"`,
@@ -257,27 +244,41 @@ function buildRawMime(opts: {
 
 function encodeHeader(value: string): string {
   if (/^[\x20-\x7E]*$/.test(value)) return value;
-  const b64 = Buffer.from(value, "utf8").toString("base64");
-  return `=?UTF-8?B?${b64}?=`;
+  return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
 }
-
 function escapeMimeHeaderValue(s: string): string {
   return s.replace(/"/g, "'").replace(/[\r\n]/g, " ").slice(0, 200);
 }
-
 function chunkBase64(s: string): string {
-  // Wrap base64 at 76 chars per RFC 2045.
   const out: string[] = [];
   for (let i = 0; i < s.length; i += 76) out.push(s.slice(i, i + 76));
   return out.join("\r\n");
 }
 
+function defaultFilename(kind: "image" | "video" | "audio" | "file", mime: string): string {
+  const ext = mimeToExt(mime);
+  if (ext) return `${kind}${ext}`;
+  return kind;
+}
 function mimeToExt(mime: string): string {
   const m = mime.toLowerCase();
+  // images
   if (m === "image/jpeg" || m === "image/jpg") return ".jpg";
   if (m === "image/png") return ".png";
   if (m === "image/gif") return ".gif";
   if (m === "image/webp") return ".webp";
   if (m === "image/heic") return ".heic";
+  // video
+  if (m === "video/mp4") return ".mp4";
+  if (m === "video/quicktime") return ".mov";
+  if (m === "video/webm") return ".webm";
+  // audio
+  if (m === "audio/m4a" || m === "audio/x-m4a" || m === "audio/mp4") return ".m4a";
+  if (m === "audio/mpeg" || m === "audio/mp3") return ".mp3";
+  if (m === "audio/wav" || m === "audio/x-wav") return ".wav";
+  if (m === "audio/ogg") return ".ogg";
+  // docs
+  if (m === "application/pdf") return ".pdf";
+  if (m === "application/zip") return ".zip";
   return "";
 }

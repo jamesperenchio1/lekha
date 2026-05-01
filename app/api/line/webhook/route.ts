@@ -25,7 +25,7 @@ import { classify, clearPending, getPending } from "@/lib/confirm";
 import { listAccounts } from "@/lib/tools/google-auth";
 import { renderDraftsBlock } from "@/lib/llm/render-drafts";
 import { executePendingAll } from "@/lib/pending-runner";
-import { getRecentImage, setRecentImage } from "@/lib/memory/recent-image";
+import { getRecentMedia, setRecentMedia } from "@/lib/memory/recent-media";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -133,20 +133,38 @@ async function handleEvent(event: LineEvent): Promise<void> {
     return;
   }
 
-  // Image messages → multimodal turn.
+  // Image messages → multimodal turn (Gemini sees it AND we stash it for attach).
   if (message.type === "image" && "id" in message && typeof message.id === "string") {
     await respondToImage(event.replyToken, userId, profile, message.id);
     return;
   }
 
-  // Sticker / audio / video / file → polite acknowledgement for now.
+  // Video / audio / file → stash for attachment, agent loop handles the response.
+  if (
+    (message.type === "video" || message.type === "audio" || message.type === "file") &&
+    "id" in message &&
+    typeof message.id === "string"
+  ) {
+    await respondToOtherMedia(
+      event.replyToken,
+      userId,
+      profile,
+      message.id,
+      message.type,
+      "fileName" in message && typeof message.fileName === "string" ? message.fileName : undefined,
+      "fileSize" in message && typeof message.fileSize === "number" ? message.fileSize : undefined,
+      "duration" in message && typeof message.duration === "number" ? message.duration : undefined,
+    );
+    return;
+  }
+
   if (message.type === "sticker") {
-    await reply(event.replyToken, [textMsg("Cute sticker. Send me text or a photo if you'd like me to do something with it.")]);
+    await reply(event.replyToken, [textMsg("Cute sticker. Send me text, a photo, or a file if you'd like me to do something with it.")]);
     return;
   }
 
   await reply(event.replyToken, [
-    textMsg("I can read text and images today. Try sending one of those!"),
+    textMsg("I didn't recognize that message type. Try text, a photo, video, audio, or a file."),
   ]);
 }
 
@@ -186,9 +204,8 @@ async function respondToImage(
   try {
     const { bytes, contentType } = await getMessageContent(messageId);
     imagePart = { type: "image", image: bytes, mediaType: contentType };
-    // Stash for ~30 min so the user can reference it for follow-up actions
-    // ("attach this image to an email", etc).
-    await setRecentImage(userId, {
+    await setRecentMedia(userId, {
+      kind: "image",
       messageId,
       contentType,
       sizeBytes: bytes.byteLength,
@@ -221,6 +238,99 @@ async function respondToImage(
   await maybeExtractFacts(userId);
 }
 
+async function respondToOtherMedia(
+  replyToken: string,
+  userId: string,
+  profile: { displayName: string },
+  messageId: string,
+  kind: "video" | "audio" | "file",
+  fileName: string | undefined,
+  fileSize: number | undefined,
+  durationMs: number | undefined,
+): Promise<void> {
+  await showLoading(userId, 15);
+
+  // We don't fetch the bytes now — just record the LINE pointer + metadata.
+  // Bytes are pulled at send time (cheap, avoids burning Redis on big files).
+  // To get the contentType we'd need to HEAD-request LINE; do a lightweight
+  // probe so the model can tell the user.
+  let contentType = guessMimeFromFilename(fileName) ?? defaultMimeForKind(kind);
+  try {
+    const head = await fetch(
+      `https://api-data.line.me/v2/bot/message/${messageId}/content`,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${env().LINE_CHANNEL_ACCESS_TOKEN}`, Range: "bytes=0-0" },
+      },
+    );
+    const ct = head.headers.get("content-type");
+    if (ct) contentType = ct;
+  } catch {
+    // best effort
+  }
+
+  await setRecentMedia(userId, {
+    kind,
+    messageId,
+    contentType,
+    fileName,
+    sizeBytes: fileSize,
+    durationMs,
+    ts: Date.now(),
+  });
+
+  const description = [
+    `(User just sent a ${kind} via LINE.`,
+    fileName ? ` Filename: "${fileName}".` : "",
+    fileSize ? ` Size: ~${(fileSize / 1024).toFixed(0)} KB.` : "",
+    durationMs ? ` Duration: ${(durationMs / 1000).toFixed(1)}s.` : "",
+    ` Mime: ${contentType}.`,
+    " It's staged for attachment via attach_recent_media on draft_email if they want it sent somewhere.)",
+  ].join("");
+
+  const history = await loadHistory(userId);
+  const facts = await loadFacts(userId);
+  const messages: ModelMessage[] = [
+    ...history.map<ModelMessage>((t) => ({ role: t.role, content: t.content })),
+    { role: "user", content: description },
+  ];
+
+  const replyText = await runAgent(userId, profile, facts, messages);
+  await reply(replyToken, [textMsg(replyText)]);
+
+  await appendTurn(userId, {
+    role: "user",
+    content: `[sent a ${kind}${fileName ? `: ${fileName}` : ""}]`,
+    ts: Date.now(),
+  });
+  await appendTurn(userId, { role: "assistant", content: replyText, ts: Date.now() });
+  await maybeExtractFacts(userId);
+}
+
+function guessMimeFromFilename(name: string | undefined): string | null {
+  if (!name) return null;
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".zip")) return "application/zip";
+  if (lower.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (lower.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (lower.endsWith(".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  if (lower.endsWith(".csv")) return "text/csv";
+  if (lower.endsWith(".txt")) return "text/plain";
+  if (lower.endsWith(".mp3")) return "audio/mpeg";
+  if (lower.endsWith(".m4a")) return "audio/mp4";
+  if (lower.endsWith(".wav")) return "audio/wav";
+  if (lower.endsWith(".mp4")) return "video/mp4";
+  if (lower.endsWith(".mov")) return "video/quicktime";
+  return null;
+}
+
+function defaultMimeForKind(kind: "video" | "audio" | "file"): string {
+  if (kind === "video") return "video/mp4";
+  if (kind === "audio") return "audio/m4a";
+  return "application/octet-stream";
+}
+
 async function runAgent(
   userId: string,
   profile: { displayName: string },
@@ -233,11 +343,11 @@ async function runAgent(
         .map((a) => `${a.email}${a.email === accounts.activeEmail ? " (active)" : ""}`)
         .join(", ")}.`
     : "";
-  const recentImg = await getRecentImage(userId);
-  const recentImgBlock = recentImg
-    ? `\n\nA recent image is staged for attachment (type ${recentImg.contentType}, ${(recentImg.sizeBytes / 1024).toFixed(0)} KB, sent ${Math.round((Date.now() - recentImg.ts) / 1000)}s ago). To attach it to an email, set \`attach_recent_image: true\` on draft_email.`
+  const recent = await getRecentMedia(userId);
+  const recentBlock = recent
+    ? `\n\nA recent ${recent.kind} is staged for attachment (mime ${recent.contentType}${recent.fileName ? `, filename "${recent.fileName}"` : ""}${recent.sizeBytes ? `, ${(recent.sizeBytes / 1024).toFixed(0)} KB` : ""}, sent ${Math.round((Date.now() - recent.ts) / 1000)}s ago). To attach it to an email, set \`attach_recent_media: true\` on draft_email.`
     : "";
-  const system = buildSystemPrompt(factsToPromptBlock(facts), profile) + accountsBlock + recentImgBlock;
+  const system = buildSystemPrompt(factsToPromptBlock(facts), profile) + accountsBlock + recentBlock;
 
   try {
     const result = await generateText({
