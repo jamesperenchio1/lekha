@@ -227,11 +227,10 @@ async function runAgent(
       providerOptions: {
         google: {
           safetySettings: [
-            { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
-            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "OFF" },
-            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "OFF" },
-            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "OFF" },
-            { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" },
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
           ],
         },
       },
@@ -252,7 +251,22 @@ async function runAgent(
       return `I'm being rate-limited. Try again in ~${inner.retryAfterSec}s.`;
     }
     console.error("[agent] unhandled", err);
-    return "Something went sideways on my end. Mind trying that again?";
+    // Debug: include the error message so we can see it in LINE.
+    const detail = errorDetail(err);
+    return `Something went sideways: ${detail}`;
+  }
+}
+
+function errorDetail(err: unknown): string {
+  if (err instanceof Error) {
+    const cause = (err as { cause?: unknown }).cause;
+    const causeStr = cause instanceof Error ? ` (cause: ${cause.name}: ${cause.message})` : "";
+    return `${err.name}: ${err.message}${causeStr}`.slice(0, 800);
+  }
+  try {
+    return JSON.stringify(err).slice(0, 800);
+  } catch {
+    return String(err).slice(0, 800);
   }
 }
 
