@@ -73,13 +73,12 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        // Pre-meeting reminders
+        // Pre-meeting reminders — fire at EACH configured lead time.
         if (
-          settings.preMeetingMinutes != null &&
-          settings.preMeetingMinutes > 0 &&
+          settings.preMeetingLeads.length > 0 &&
           (await hasGoogleConnection(userId))
         ) {
-          await sweepPreMeetingPushes(userId, settings.preMeetingMinutes, settings.timezone, stats);
+          await sweepPreMeetingPushes(userId, settings.preMeetingLeads, settings.timezone, stats);
         }
       } catch (err) {
         stats.errors++;
@@ -93,7 +92,7 @@ export async function POST(req: NextRequest) {
 
 async function sweepPreMeetingPushes(
   userId: string,
-  leadMinutes: number,
+  leads: number[],
   timezone: string,
   stats: { preMeetingPushes: number },
 ): Promise<void> {
@@ -102,34 +101,44 @@ async function sweepPreMeetingPushes(
   ]);
   const calendar = google.calendar({ version: "v3", auth: client });
   const now = Date.now();
-  const max = now + leadMinutes * 60 * 1000 + 16 * 60 * 1000; // sweep window + slack
+  // Look ahead by the longest lead + sweep slack; we'll bucket each event by lead.
+  const longest = Math.max(...leads);
   const r = await calendar.events.list({
     calendarId: "primary",
     timeMin: new Date(now).toISOString(),
-    timeMax: new Date(max).toISOString(),
+    timeMax: new Date(now + longest * 60_000 + 16 * 60_000).toISOString(),
     singleEvents: true,
     orderBy: "startTime",
-    maxResults: 10,
+    maxResults: 25,
   });
   for (const e of r.data.items ?? []) {
     const startISO = e.start?.dateTime ?? e.start?.date;
     if (!startISO || !e.id) continue;
     const startTs = new Date(startISO).getTime();
     const minutesUntil = Math.round((startTs - now) / 60_000);
-    if (minutesUntil > leadMinutes || minutesUntil < leadMinutes - 16) continue;
-    // Idempotency: don't push twice for same event.
-    const seenKey = `premeet:${userId}:${e.id}`;
-    const set = await redis().set(seenKey, 1, { ex: 60 * 60 * 6, nx: true });
-    if (set === null) continue;
-    const local = new Date(startTs).toLocaleTimeString("en-US", {
-      timeZone: timezone,
-      hour: "numeric",
-      minute: "2-digit",
-    });
-    const where = e.location ? ` @ ${e.location}` : "";
-    await push(userId, [
-      textMsg(`🔔 In ~${minutesUntil} min: ${e.summary ?? "(untitled)"} at ${local}${where}.`),
-    ]);
-    stats.preMeetingPushes++;
+    // For each configured lead, check if we're within its 16-min sweep window.
+    for (const lead of leads) {
+      if (minutesUntil > lead || minutesUntil < lead - 16) continue;
+      // Idempotency keyed by (event, lead) — so 1d/1h/30m alerts each fire once.
+      const seenKey = `premeet:${userId}:${e.id}:${lead}`;
+      const set = await redis().set(seenKey, 1, { ex: 60 * 60 * 24 * 2, nx: true });
+      if (set === null) continue;
+      const local = new Date(startTs).toLocaleTimeString("en-US", {
+        timeZone: timezone,
+        hour: "numeric",
+        minute: "2-digit",
+      });
+      const where = e.location ? ` @ ${e.location}` : "";
+      const leadLabel =
+        lead >= 1440 && lead % 1440 === 0
+          ? `${lead / 1440}d`
+          : lead >= 60 && lead % 60 === 0
+          ? `${lead / 60}h`
+          : `${lead}m`;
+      await push(userId, [
+        textMsg(`🔔 In ~${leadLabel}: ${e.summary ?? "(untitled)"} at ${local}${where}.`),
+      ]);
+      stats.preMeetingPushes++;
+    }
   }
 }

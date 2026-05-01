@@ -4,6 +4,12 @@ import { getSettings, updateSettings } from "@/lib/memory/settings";
 
 const TZ_REGEX = /^[A-Za-z][A-Za-z_]*\/[A-Za-z][A-Za-z_]*(?:\/[A-Za-z][A-Za-z_]*)?$/;
 
+function formatLead(minutes: number): string {
+  if (minutes >= 1440 && minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes >= 60 && minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
 export function buildSettingsTools(userId: string) {
   return {
     get_my_settings: tool({
@@ -78,11 +84,22 @@ export function buildSettingsTools(userId: string) {
 
     enable_pre_meeting_alerts: tool({
       description:
-        "Push the user a heads-up N minutes before each upcoming calendar event. Pass null to disable.",
-      inputSchema: z.object({ minutes: z.number().int().min(0).max(1440).nullable() }),
-      execute: async ({ minutes }) => {
-        await updateSettings(userId, { preMeetingMinutes: minutes });
-        return { ok: true, preMeetingMinutes: minutes };
+        "Push the user a heads-up at multiple intervals before each upcoming calendar event. Pass an array of minutes-before. Common picks: [1440, 60, 30] = 1 day, 1 hour, 30 min before. Pass [] to disable.",
+      inputSchema: z.object({
+        minutes_before: z
+          .array(z.number().int().min(0).max(60 * 24 * 7))
+          .max(6)
+          .describe("Minutes-before-event to alert. e.g. [1440, 60, 30] for 1d/1h/30m. Empty array disables."),
+      }),
+      execute: async ({ minutes_before }) => {
+        // Sort descending so cron sweep checks longest leads first.
+        const sorted = [...minutes_before].sort((a, b) => b - a);
+        await updateSettings(userId, { preMeetingLeads: sorted });
+        return {
+          ok: true,
+          preMeetingLeads: sorted,
+          note: sorted.length === 0 ? "Pre-meeting alerts disabled." : `Will push at ${sorted.map((m) => formatLead(m)).join(", ")} before each event.`,
+        };
       },
     }),
   };

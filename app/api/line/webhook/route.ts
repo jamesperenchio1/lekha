@@ -15,6 +15,7 @@ import { appendTurn, loadHistory, turnCounter } from "@/lib/memory/history";
 import { loadFacts, factsToPromptBlock } from "@/lib/memory/facts";
 import { getOrCreateProfile, isFirstContact } from "@/lib/memory/profile";
 import { chatModel, fallbackChatModels } from "@/lib/llm/provider";
+import { isGeminiDown, markGeminiDown } from "@/lib/llm/health";
 import type { LanguageModel } from "ai";
 import { buildSystemPrompt } from "@/lib/llm/prompts";
 import { extractAndMergeFacts } from "@/lib/llm/extract-facts";
@@ -402,7 +403,8 @@ You have these tools available right now — use them whenever the user's reques
 - crypto_price(coin)          — current crypto price (bitcoin, ethereum, btc, eth, …). USE THIS for any crypto question.
 - fx_rate(from, to, amount)   — currency conversion. USE THIS for any FX question.
 - weather(location)           — current weather + 3-day forecast. USE THIS for any weather question.
-- web_search(query)           — general web search for everything else (news, articles, who-is-X).
+- news_search(query, days?)   — recent news headlines + sources. USE THIS for any news question.
+- web_search(query)           — general web search for everything else (articles, who-is-X). NOT for stocks/crypto/weather/news.
 - set_reminder(when, message) — schedule a reminder push.
 - list_reminders / list_tasks / list_memories — show stored items.
 - add_task(title, dueAt?)     — add a persistent task.
@@ -411,10 +413,13 @@ You have these tools available right now — use them whenever the user's reques
 - contacts_search(query)      — find an email/phone in the user's Google Contacts.
 - draft_email({to, subject, body, …})       — compose an email (queues for YES confirm).
 - draft_calendar_event({summary, startISO, endISO, attendees?, …}) — compose a calendar event.
+- calendar_today / calendar_week — see today's or this week's events.
 - ocr_image / transcribe_audio — extract text from a recently-sent image / voice memo.
 - show_help                   — list all capabilities to the user.
 
-If none of these tools fit the question, answer briefly from your own knowledge. Don't make up tool capabilities that aren't listed.`;
+If none of these tools fit the question, answer briefly from your own knowledge. Don't make up tool capabilities that aren't listed.
+
+CRITICAL: when a tool returns { ok: false, error: "..." }, RELAY THE EXACT ERROR to the user (one short sentence). Never say "I'm having a technical hiccup" or "let me get that sorted" — those are useless evasions. Tell the user what actually broke so they can react.`;
 
   try {
     const result = await runWithCascade({
@@ -566,6 +571,15 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   slimTools?: ReturnType<typeof coreToolsForUser>;
 }) {
   const tStart = Date.now();
+  // If we marked Gemini as down recently (after a 503/quota), skip it entirely
+  // and go straight to the Groq fallback path. Avoids burning ~5s per request
+  // hitting an upstream that's known to be unhealthy.
+  const skipGemini = !opts.hasMultimodal && (await isGeminiDown());
+  if (skipGemini) {
+    console.log("[agent] skipping gemini (recent overload mark)");
+    throw new Error("gemini-skipped");
+  }
+
   try {
     const r = await withTimeout(
       generateText({
@@ -599,13 +613,18 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
     return r;
   } catch (err) {
     const isTimeout = err instanceof AgentTimeoutError;
+    const isSkip = err instanceof Error && err.message === "gemini-skipped";
     const quota = parseQuotaError(err);
-    if (!quota && !isTimeout) throw err;
+    if (!quota && !isTimeout && !isSkip) throw err;
     const fallbacks = fallbackChatModels();
     if (!fallbacks.length || opts.hasMultimodal) throw err;
+    if (!isSkip) {
+      // Mark Gemini down so the next ~60s of requests skip it.
+      await markGeminiDown(60).catch(() => {});
+    }
     console.warn(
       "[agent] cascading to groq",
-      isTimeout ? "(gemini timeout)" : `(gemini quota/overload, retry-after ~${quota?.retryAfterSec}s)`,
+      isSkip ? "(gemini pre-skipped)" : isTimeout ? "(gemini timeout)" : `(gemini quota/overload, retry-after ~${quota?.retryAfterSec}s)`,
       { totalMs: Date.now() - tStart, fallbackModels: fallbacks.length },
     );
     // On the fallback path, ship a slim system prompt + the core tool subset.

@@ -30,40 +30,59 @@ export function buildFinanceTools() {
         ticker: z.string().min(1).max(10).describe("Ticker symbol like NVDA, AAPL, TSLA, GOOG"),
       }),
       execute: async ({ ticker }) => {
+        // Yahoo's /v7/quote endpoint started returning 401 to server-side calls
+        // (it now needs a "crumb" cookie). The /v8/chart endpoint is still wide open.
+        const symbol = ticker.toUpperCase();
+        const t0 = Date.now();
         try {
-          // Yahoo Finance public quote endpoint — no auth required.
-          const t0 = Date.now();
           const data = await fetchJSON<{
-            quoteResponse?: { result?: Array<{
-              symbol?: string;
-              shortName?: string;
-              regularMarketPrice?: number;
-              regularMarketChange?: number;
-              regularMarketChangePercent?: number;
-              currency?: string;
-              marketState?: string;
-              regularMarketTime?: number;
-            }> };
-          }>(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker.toUpperCase())}`,
-             { headers: { "user-agent": "Mozilla/5.0 lekha-bot" } });
-          console.log("[stock_price]", { ticker, ms: Date.now() - t0 });
-          const q = data.quoteResponse?.result?.[0];
-          if (!q || q.regularMarketPrice == null) {
-            return { ok: false, error: `No data for ${ticker}` };
+            chart?: {
+              result?: Array<{
+                meta?: {
+                  symbol?: string;
+                  regularMarketPrice?: number;
+                  previousClose?: number;
+                  chartPreviousClose?: number;
+                  currency?: string;
+                  exchangeName?: string;
+                  marketState?: string;
+                  regularMarketTime?: number;
+                };
+              }>;
+              error?: { code?: string; description?: string } | null;
+            };
+          }>(
+            `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=1d`,
+            { headers: { "user-agent": "Mozilla/5.0 lekha-bot/1.0" } },
+          );
+          console.log("[stock_price]", { ticker: symbol, ms: Date.now() - t0 });
+          if (data.chart?.error) {
+            return { ok: false, error: `Yahoo: ${data.chart.error.description ?? data.chart.error.code}` };
           }
+          const meta = data.chart?.result?.[0]?.meta;
+          if (!meta || meta.regularMarketPrice == null) {
+            return { ok: false, error: `No price found for ticker "${symbol}". Check the symbol spelling.` };
+          }
+          const prev = meta.previousClose ?? meta.chartPreviousClose ?? null;
+          const change = prev != null ? meta.regularMarketPrice - prev : null;
+          const changePct = prev != null && prev !== 0 ? (change! / prev) * 100 : null;
           return {
             ok: true,
-            symbol: q.symbol,
-            name: q.shortName,
-            price: q.regularMarketPrice,
-            change: q.regularMarketChange,
-            changePercent: q.regularMarketChangePercent,
-            currency: q.currency ?? "USD",
-            marketState: q.marketState,
-            asOf: q.regularMarketTime ? new Date(q.regularMarketTime * 1000).toISOString() : null,
+            symbol: meta.symbol,
+            price: meta.regularMarketPrice,
+            previousClose: prev,
+            change,
+            changePercent: changePct,
+            currency: meta.currency ?? "USD",
+            exchange: meta.exchangeName ?? null,
+            marketState: meta.marketState,
+            asOf: meta.regularMarketTime ? new Date(meta.regularMarketTime * 1000).toISOString() : null,
           };
         } catch (err) {
-          return { ok: false, error: err instanceof Error ? err.message : "Lookup failed" };
+          return {
+            ok: false,
+            error: `Stock lookup failed for ${symbol}: ${err instanceof Error ? err.message : String(err)}`,
+          };
         }
       },
     }),

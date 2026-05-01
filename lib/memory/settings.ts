@@ -9,8 +9,8 @@ export type UserSettings = {
   location: string | null;
   /** Daily morning-briefing time in HH:mm 24h, in user's timezone. null = disabled. */
   morningBriefingTime: string | null;
-  /** Pre-meeting reminder lead in minutes. null = disabled. */
-  preMeetingMinutes: number | null;
+  /** Pre-meeting reminder lead times in minutes. Empty = disabled. e.g. [1440, 60, 30] for 1d/1h/30m before. */
+  preMeetingLeads: number[];
   /** Whether to auto-summarize unread Gmail in the morning briefing. */
   inboxBriefingEnabled: boolean;
   /** Last time we ran the morning briefing for this user (ms). */
@@ -25,7 +25,7 @@ const DEFAULTS: UserSettings = {
   language: null,
   location: null,
   morningBriefingTime: null,
-  preMeetingMinutes: null,
+  preMeetingLeads: [],
   inboxBriefingEnabled: false,
   lastMorningBriefingTs: null,
   disabledCategories: [],

@@ -17,6 +17,7 @@ import { buildScheduledEmailTools } from "./scheduled-email";
 import { buildSentHistoryTools } from "./sent-history";
 import { buildFinanceTools } from "./finance";
 import { buildWeatherTools } from "./weather";
+import { buildNewsTools } from "./news";
 import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 
 /**
@@ -28,6 +29,7 @@ export function toolsForUser(userId: string) {
     ...buildHelpTools(),
     ...buildFinanceTools(),
     ...buildWeatherTools(),
+    ...(env().TAVILY_API_KEY ? buildNewsTools() : {}),
     ...buildSettingsTools(userId),
     ...buildMemoryTools(userId),
     ...buildTaskTools(userId),
@@ -57,11 +59,11 @@ export function coreToolsForUser(userId: string) {
   const keep = [
     "show_help",
     "remember", "list_memories",
-    "stock_price", "crypto_price", "fx_rate", "weather", "web_search",
+    "stock_price", "crypto_price", "fx_rate", "weather", "web_search", "news_search",
     "set_reminder", "list_reminders",
     "add_task", "list_tasks", "complete_task",
     "contacts_search",
-    "draft_email", "draft_calendar_event",
+    "draft_email", "draft_calendar_event", "calendar_today", "calendar_week",
     "ocr_image", "transcribe_audio",
   ] as const;
   const out: Record<string, unknown> = {};
