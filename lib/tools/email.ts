@@ -4,7 +4,7 @@ import { google } from "googleapis";
 import { withGoogleClient } from "./with-google";
 import { getGoogleClient } from "./google-auth";
 import { appendPending, type SendEmailAction } from "@/lib/confirm";
-import { getRecentMedia } from "@/lib/memory/recent-media";
+import { listRecentMedia, clearRecentMedia } from "@/lib/memory/recent-media";
 import { getMessageContent } from "@/lib/line/client";
 
 const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send";
@@ -14,7 +14,7 @@ export function buildEmailTools(userId: string) {
   return {
     draft_email: tool({
       description:
-        "Draft an email to send from one of the user's connected Gmail accounts. Does NOT send — appends to the pending confirm queue. Pass arrays for to/cc/bcc. Attach Drive files via `attachments: [{fileId}]`. Attach a file the user just sent in LINE (image, video, audio, or document) via `attach_recent_media: true`.",
+        "Draft an email from one of the user's connected Gmail accounts. Does NOT send — appends to the pending confirm queue. Pass arrays for to/cc/bcc. Attach Drive files via `attachments`. Attach files the user just sent in LINE (image/video/audio/document) via `attach_recent_media: true` (attaches ALL staged) or `attach_recent_media_indexes: [1,3]` (1-indexed cherry-pick from oldest).",
       inputSchema: z.object({
         to: z.array(z.string().email()).min(1).max(50),
         cc: z.array(z.string().email()).max(50).optional(),
@@ -40,48 +40,68 @@ export function buildEmailTools(userId: string) {
           .boolean()
           .optional()
           .describe(
-            "Set true to attach whatever the user most recently sent in LINE (image / video / audio / document). The system kept it for ~30 min after they sent it.",
+            "Attach ALL files the user has recently sent in LINE (within ~30 min, up to 10). Mutually exclusive with attach_recent_media_indexes.",
           ),
-        attach_recent_media_filename: z
-          .string()
-          .max(120)
+        attach_recent_media_indexes: z
+          .array(z.number().int().min(1))
+          .max(10)
           .optional()
           .describe(
-            "Filename override for the staged LINE media. Defaults to its original name (or image.jpg / video.mp4 / etc).",
+            "1-indexed positions of staged LINE files to attach (oldest is 1). Use when the user only wants some of the staged files.",
+          ),
+        attach_recent_media_filenames: z
+          .array(z.string().max(120))
+          .max(10)
+          .optional()
+          .describe(
+            "Optional filename overrides aligned to the SAME order as attach_recent_media_indexes (or to all staged items if attach_recent_media is true). Empty string means keep default.",
           ),
       }),
       execute: async ({
         to, cc, bcc, subject, body, fromEmail, attachments,
-        attach_recent_media, attach_recent_media_filename,
+        attach_recent_media, attach_recent_media_indexes, attach_recent_media_filenames,
       }) => {
-        if (attach_recent_media) {
-          const recent = await getRecentMedia(userId);
-          if (!recent) {
+        const wantsMedia =
+          attach_recent_media === true ||
+          (attach_recent_media_indexes && attach_recent_media_indexes.length > 0);
+
+        if (wantsMedia) {
+          const staged = await listRecentMedia(userId);
+          if (staged.length === 0) {
             return {
               ok: false as const,
               error:
-                "No recent LINE media is staged. Ask the user to (re)send the file in LINE; I keep each one for ~30 min.",
+                "No LINE media is currently staged. Ask the user to send the file(s) in LINE; I keep them for ~30 min.",
             };
           }
+          if (attach_recent_media_indexes) {
+            const max = staged.length;
+            const bad = attach_recent_media_indexes.filter((i) => i < 1 || i > max);
+            if (bad.length) {
+              return {
+                ok: false as const,
+                error: `Invalid attach_recent_media_indexes ${bad.join(",")}. Only 1..${max} are staged.`,
+              };
+            }
+          }
         }
+
         const action: SendEmailAction = {
           kind: "send_email",
-          to,
-          cc,
-          bcc,
-          subject,
-          body,
-          fromEmail,
-          attachments,
+          to, cc, bcc, subject, body, fromEmail, attachments,
           attachRecentMedia: attach_recent_media,
-          attachRecentMediaFilename: attach_recent_media_filename,
+          attachRecentMediaIndexes: attach_recent_media_indexes,
+          attachRecentMediaFilenames: attach_recent_media_filenames,
         };
         await appendPending(userId, action);
         return {
           status: "draft_pending_confirmation" as const,
-          draft: { to, cc, bcc, subject, body, fromEmail, attachments, attach_recent_media },
+          draft: {
+            to, cc, bcc, subject, body, fromEmail, attachments,
+            attach_recent_media, attach_recent_media_indexes, attach_recent_media_filenames,
+          },
           instruction:
-            "The system shows the verbatim draft to the user. Don't paraphrase the body.",
+            "The system shows the verbatim draft + attachment list to the user. Don't paraphrase the body.",
         };
       },
     }),
@@ -97,22 +117,41 @@ export async function sendEmail(
   const gmail = google.gmail({ version: "v1", auth: client });
 
   const fetched: FetchedAttachment[] = [];
+
   for (const att of args.attachments ?? []) {
     fetched.push(await fetchDriveFile(userId, att.fileId, att.fromEmail));
   }
-  if (args.attachRecentMedia) {
-    const recent = await getRecentMedia(userId);
-    if (!recent) {
-      throw new Error(
-        "Recent LINE media expired before send. Ask the user to resend the file and retry.",
-      );
+
+  let usedRecentMedia = false;
+  if (args.attachRecentMedia || args.attachRecentMediaIndexes?.length) {
+    const staged = await listRecentMedia(userId);
+    if (staged.length === 0) {
+      throw new Error("Recent LINE media expired before send. Resend the file(s) and retry.");
     }
-    const { bytes, contentType } = await getMessageContent(recent.messageId);
-    const filename =
-      args.attachRecentMediaFilename ??
-      recent.fileName ??
-      defaultFilename(recent.kind, contentType);
-    fetched.push({ filename, mimeType: contentType, bytes });
+    const targets: { item: typeof staged[number]; idx: number }[] = [];
+    if (args.attachRecentMediaIndexes?.length) {
+      for (const oneBased of args.attachRecentMediaIndexes) {
+        const idx = oneBased - 1;
+        if (idx < 0 || idx >= staged.length) {
+          throw new Error(`Staged media index ${oneBased} no longer valid (only ${staged.length} now).`);
+        }
+        targets.push({ item: staged[idx]!, idx });
+      }
+    } else {
+      staged.forEach((item, idx) => targets.push({ item, idx }));
+    }
+
+    for (let i = 0; i < targets.length; i++) {
+      const { item } = targets[i]!;
+      const { bytes, contentType } = await getMessageContent(item.messageId);
+      const overrideName = args.attachRecentMediaFilenames?.[i];
+      const filename =
+        (overrideName && overrideName.length > 0 ? overrideName : null) ??
+        item.fileName ??
+        defaultFilename(item.kind, contentType);
+      fetched.push({ filename, mimeType: contentType, bytes });
+    }
+    usedRecentMedia = true;
   }
 
   const raw = buildRawMime({
@@ -126,6 +165,11 @@ export async function sendEmail(
   });
 
   await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+
+  // Once successfully sent with staged media, clear the staged list so the
+  // user doesn't accidentally re-attach the same files in the next email.
+  if (usedRecentMedia) await clearRecentMedia(userId);
+
   return { from };
 }
 
@@ -147,10 +191,7 @@ async function fetchDriveFile(
     const mime = meta.data.mimeType ?? "application/octet-stream";
 
     const exportMap: Record<string, { mime: string; ext: string }> = {
-      "application/vnd.google-apps.document": {
-        mime: "application/pdf",
-        ext: ".pdf",
-      },
+      "application/vnd.google-apps.document": { mime: "application/pdf", ext: ".pdf" },
       "application/vnd.google-apps.spreadsheet": {
         mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ext: ".xlsx",
@@ -254,30 +295,24 @@ function chunkBase64(s: string): string {
   for (let i = 0; i < s.length; i += 76) out.push(s.slice(i, i + 76));
   return out.join("\r\n");
 }
-
 function defaultFilename(kind: "image" | "video" | "audio" | "file", mime: string): string {
   const ext = mimeToExt(mime);
-  if (ext) return `${kind}${ext}`;
-  return kind;
+  return ext ? `${kind}${ext}` : kind;
 }
 function mimeToExt(mime: string): string {
   const m = mime.toLowerCase();
-  // images
   if (m === "image/jpeg" || m === "image/jpg") return ".jpg";
   if (m === "image/png") return ".png";
   if (m === "image/gif") return ".gif";
   if (m === "image/webp") return ".webp";
   if (m === "image/heic") return ".heic";
-  // video
   if (m === "video/mp4") return ".mp4";
   if (m === "video/quicktime") return ".mov";
   if (m === "video/webm") return ".webm";
-  // audio
   if (m === "audio/m4a" || m === "audio/x-m4a" || m === "audio/mp4") return ".m4a";
   if (m === "audio/mpeg" || m === "audio/mp3") return ".mp3";
   if (m === "audio/wav" || m === "audio/x-wav") return ".wav";
   if (m === "audio/ogg") return ".ogg";
-  // docs
   if (m === "application/pdf") return ".pdf";
   if (m === "application/zip") return ".zip";
   return "";

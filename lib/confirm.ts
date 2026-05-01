@@ -11,9 +11,12 @@ export type SendEmailAction = {
   body: string;
   fromEmail?: string;
   attachments?: { fileId: string; fromEmail?: string }[];
-  /** Attach the most recent media file (image/video/audio/file) the user sent in LINE. */
+  /** Attach ALL staged LINE media. Mutually exclusive with attachRecentMediaIndexes. */
   attachRecentMedia?: boolean;
-  attachRecentMediaFilename?: string;
+  /** 1-indexed cherry-pick from staged LINE media (oldest is 1). */
+  attachRecentMediaIndexes?: number[];
+  /** Filename overrides aligned to the same order as the indexes (or all staged when attachRecentMedia is true). */
+  attachRecentMediaFilenames?: string[];
 };
 
 export type CreateCalendarEventAction = {

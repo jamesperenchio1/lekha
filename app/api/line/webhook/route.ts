@@ -25,7 +25,7 @@ import { classify, clearPending, getPending } from "@/lib/confirm";
 import { listAccounts } from "@/lib/tools/google-auth";
 import { renderDraftsBlock } from "@/lib/llm/render-drafts";
 import { executePendingAll } from "@/lib/pending-runner";
-import { getRecentMedia, setRecentMedia } from "@/lib/memory/recent-media";
+import { appendRecentMedia, listRecentMedia } from "@/lib/memory/recent-media";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -204,7 +204,7 @@ async function respondToImage(
   try {
     const { bytes, contentType } = await getMessageContent(messageId);
     imagePart = { type: "image", image: bytes, mediaType: contentType };
-    await setRecentMedia(userId, {
+    await appendRecentMedia(userId, {
       kind: "image",
       messageId,
       contentType,
@@ -269,7 +269,7 @@ async function respondToOtherMedia(
     // best effort
   }
 
-  await setRecentMedia(userId, {
+  await appendRecentMedia(userId, {
     kind,
     messageId,
     contentType,
@@ -343,9 +343,22 @@ async function runAgent(
         .map((a) => `${a.email}${a.email === accounts.activeEmail ? " (active)" : ""}`)
         .join(", ")}.`
     : "";
-  const recent = await getRecentMedia(userId);
-  const recentBlock = recent
-    ? `\n\nA recent ${recent.kind} is staged for attachment (mime ${recent.contentType}${recent.fileName ? `, filename "${recent.fileName}"` : ""}${recent.sizeBytes ? `, ${(recent.sizeBytes / 1024).toFixed(0)} KB` : ""}, sent ${Math.round((Date.now() - recent.ts) / 1000)}s ago). To attach it to an email, set \`attach_recent_media: true\` on draft_email.`
+  const staged = await listRecentMedia(userId);
+  const recentBlock = staged.length
+    ? `\n\nLINE files staged for attachment (1-indexed, oldest first):\n${staged
+        .map((m, i) => {
+          const ago = Math.round((Date.now() - m.ts) / 60_000);
+          const parts = [
+            `${i + 1}. ${m.kind}`,
+            m.fileName ? `"${m.fileName}"` : null,
+            `(${m.contentType}`,
+            m.sizeBytes ? `, ${(m.sizeBytes / 1024).toFixed(0)} KB` : "",
+            `)`,
+            `— ${ago}m ago`,
+          ];
+          return parts.filter(Boolean).join(" ");
+        })
+        .join("\n")}\nUse \`attach_recent_media: true\` to attach all of them, or \`attach_recent_media_indexes: [n,…]\` to pick specific ones.`
     : "";
   const system = buildSystemPrompt(factsToPromptBlock(facts), profile) + accountsBlock + recentBlock;
 

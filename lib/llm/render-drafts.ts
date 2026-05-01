@@ -27,7 +27,8 @@ export function renderDraftsBlock(
         fromEmail?: string;
         attachments?: { fileId: string }[];
         attach_recent_media?: boolean;
-        attach_recent_media_filename?: string;
+        attach_recent_media_indexes?: number[];
+        attach_recent_media_filenames?: string[];
       };
       const lines = [
         "📧 Draft email",
@@ -43,11 +44,15 @@ export function renderDraftsBlock(
           `${args.attachments.length} from Drive (ids: ${args.attachments.map((a) => a.fileId).join(", ")})`,
         );
       }
-      if (args.attach_recent_media) {
+      if (args.attach_recent_media_indexes?.length) {
+        const which = args.attach_recent_media_indexes.join(", ");
+        attBits.push(`LINE files #${which}`);
+      } else if (args.attach_recent_media) {
+        attBits.push("ALL staged LINE files");
+      }
+      if (args.attach_recent_media_filenames?.length) {
         attBits.push(
-          args.attach_recent_media_filename
-            ? `the LINE file you sent (as ${args.attach_recent_media_filename})`
-            : "the LINE file you most recently sent",
+          `(renamed: ${args.attach_recent_media_filenames.filter(Boolean).join(", ") || "—"})`,
         );
       }
       if (attBits.length) lines.push(`Attachments: ${attBits.join("; ")}`);

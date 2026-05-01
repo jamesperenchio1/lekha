@@ -5,6 +5,7 @@ import { buildEmailTools } from "./email";
 import { buildCalendarTools } from "./calendar";
 import { buildDriveTools } from "./drive";
 import { buildGoogleAccountTools } from "./google-accounts";
+import { buildStagedMediaTools } from "./staged-media";
 import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 
 /**
@@ -20,5 +21,6 @@ export function toolsForUser(userId: string) {
     ...(hasGoogleOAuth() ? buildCalendarTools(userId) : {}),
     ...(hasGoogleOAuth() ? buildDriveTools(userId) : {}),
     ...(hasGoogleOAuth() ? buildGoogleAccountTools(userId) : {}),
+    ...buildStagedMediaTools(userId),
   };
 }
