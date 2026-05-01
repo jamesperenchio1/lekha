@@ -5,9 +5,13 @@ const TTL_SEC = 5 * 60;
 export type SendEmailAction = {
   kind: "send_email";
   to: string[];
+  cc?: string[];
+  bcc?: string[];
   subject: string;
   body: string;
-  fromEmail?: string; // which connected Google account to send from
+  fromEmail?: string;
+  /** Drive file IDs to attach. The bot fetches their bytes at send time. */
+  attachments?: { fileId: string; fromEmail?: string }[];
 };
 
 export type CreateCalendarEventAction = {
@@ -25,12 +29,18 @@ export type PendingAction = SendEmailAction | CreateCalendarEventAction;
 
 const key = (userId: string) => `pending:${userId}`;
 
-export async function setPending(userId: string, action: PendingAction): Promise<void> {
-  await redis().set(key(userId), action, { ex: TTL_SEC });
+/** Append an action to the pending queue (TTL 5 min). */
+export async function appendPending(userId: string, action: PendingAction): Promise<void> {
+  const existing = await getPending(userId);
+  const next = [...existing, action];
+  await redis().set(key(userId), next, { ex: TTL_SEC });
 }
 
-export async function getPending(userId: string): Promise<PendingAction | null> {
-  return (await redis().get<PendingAction>(key(userId))) ?? null;
+export async function getPending(userId: string): Promise<PendingAction[]> {
+  const v = await redis().get<PendingAction[] | PendingAction>(key(userId));
+  if (!v) return [];
+  // Backward compat: previous schema stored a single object.
+  return Array.isArray(v) ? v : [v];
 }
 
 export async function clearPending(userId: string): Promise<void> {

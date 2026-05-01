@@ -3,7 +3,7 @@ import { tool } from "ai";
 import { google } from "googleapis";
 import { getGoogleClient } from "./google-auth";
 import { withGoogleClient } from "./with-google";
-import { setPending, type CreateCalendarEventAction } from "@/lib/confirm";
+import { appendPending, type CreateCalendarEventAction } from "@/lib/confirm";
 
 const CAL_SCOPE = "https://www.googleapis.com/auth/calendar.events";
 
@@ -36,7 +36,7 @@ export function buildCalendarTools(userId: string) {
           location,
           fromEmail,
         };
-        await setPending(userId, action);
+        await appendPending(userId, action);
         return {
           status: "draft_pending_confirmation" as const,
           draft: { summary, startISO, endISO, description, attendees, location, fromEmail },

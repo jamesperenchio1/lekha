@@ -24,7 +24,7 @@ import { checkRateLimit } from "@/lib/ratelimit";
 import { classify, clearPending, getPending } from "@/lib/confirm";
 import { listAccounts } from "@/lib/tools/google-auth";
 import { renderDraftsBlock } from "@/lib/llm/render-drafts";
-import { executePending } from "@/lib/pending-runner";
+import { executePendingAll } from "@/lib/pending-runner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -104,13 +104,13 @@ async function handleEvent(event: LineEvent): Promise<void> {
   if (message.type === "text" && "text" in message && typeof message.text === "string") {
     const userText = message.text.trim();
 
-    // If a pending action is awaiting confirmation, intercept.
+    // If pending actions are awaiting confirmation, intercept.
     const pending = await getPending(userId);
-    if (pending) {
+    if (pending.length > 0) {
       const decision = classify(userText);
       if (decision === "yes") {
-        await showLoading(userId, 15);
-        const result = await executePending(userId, pending);
+        await showLoading(userId, 25);
+        const result = await executePendingAll(userId, pending);
         await clearPending(userId);
         await reply(event.replyToken, [textMsg(result)]);
         await appendTurn(userId, { role: "user", content: userText, ts: Date.now() });
@@ -119,10 +119,12 @@ async function handleEvent(event: LineEvent): Promise<void> {
       }
       if (decision === "no") {
         await clearPending(userId);
-        await reply(event.replyToken, [textMsg("Cancelled.")]);
+        await reply(event.replyToken, [
+          textMsg(`Cancelled ${pending.length === 1 ? "that" : `all ${pending.length}`}.`),
+        ]);
         return;
       }
-      // Otherwise: discard the pending and let the model handle the new instruction.
+      // Otherwise: discard the pending list and let the model handle the new instruction.
       await clearPending(userId);
     }
 

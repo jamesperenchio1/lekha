@@ -4,18 +4,38 @@ import { sendEmail } from "@/lib/tools/email";
 import { createCalendarEvent } from "@/lib/tools/calendar";
 import type { PendingAction } from "@/lib/confirm";
 
-/** Execute a previously-confirmed pending action. Returns user-facing reply text. */
-export async function executePending(userId: string, action: PendingAction): Promise<string> {
+/** Execute a queue of previously-confirmed pending actions in order. Returns user-facing reply. */
+export async function executePendingAll(
+  userId: string,
+  actions: PendingAction[],
+): Promise<string> {
+  if (!actions.length) return "Nothing to confirm.";
+  const lines: string[] = [];
+  for (const action of actions) {
+    lines.push(await executeOne(userId, action));
+  }
+  return lines.join("\n");
+}
+
+async function executeOne(userId: string, action: PendingAction): Promise<string> {
   if (action.kind === "send_email") {
     try {
       const r = await sendEmail(userId, action);
-      return `✅ Sent to ${action.to.join(", ")} (from ${r.from}).`;
+      const recipients = [
+        ...action.to,
+        ...(action.cc ?? []).map((c) => `cc:${c}`),
+        ...(action.bcc ?? []).map((b) => `bcc:${b}`),
+      ].join(", ");
+      const att = action.attachments?.length
+        ? ` with ${action.attachments.length} attachment(s)`
+        : "";
+      return `✅ Sent to ${recipients} (from ${r.from})${att}.`;
     } catch (err) {
       if (unwrapAuthRequired(err)) {
         return `I need Google access first. Connect here:\n${buildConnectUrl(userId)}`;
       }
       console.error("[send] failed", err);
-      return "I couldn't send that. Want me to try again?";
+      return `I couldn't send the email: ${errMsg(err)}`;
     }
   }
   if (action.kind === "create_calendar_event") {
@@ -28,10 +48,15 @@ export async function executePending(userId: string, action: PendingAction): Pro
         return `I need Google access first. Connect here:\n${buildConnectUrl(userId)}`;
       }
       console.error("[calendar] failed", err);
-      return "I couldn't add that. Want me to try again?";
+      return `I couldn't create the event: ${errMsg(err)}`;
     }
   }
   return "Done.";
+}
+
+function errMsg(err: unknown): string {
+  if (err instanceof Error) return err.message.slice(0, 300);
+  return String(err).slice(0, 300);
 }
 
 function unwrapAuthRequired(err: unknown): boolean {

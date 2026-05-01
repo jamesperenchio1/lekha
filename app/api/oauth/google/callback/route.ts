@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { completeOAuth } from "@/lib/tools/google-auth";
 import { push, text as textMsg } from "@/lib/line/client";
 import { clearPending, getPending } from "@/lib/confirm";
-import { executePending } from "@/lib/pending-runner";
+import { executePendingAll } from "@/lib/pending-runner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,8 +36,8 @@ export async function GET(req: NextRequest) {
   let resumed = false;
   try {
     const pending = await getPending(userId);
-    if (pending) {
-      const replyText = await executePending(userId, pending);
+    if (pending.length > 0) {
+      const replyText = await executePendingAll(userId, pending);
       await clearPending(userId);
       await push(userId, [textMsg(replyText)]);
       resumed = true;
