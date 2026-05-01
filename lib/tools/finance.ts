@@ -87,6 +87,65 @@ export function buildFinanceTools() {
       },
     }),
 
+    stock_history: tool({
+      description:
+        "Get historical price movement for a stock ticker. Returns first / last / high / low / change% over the requested range. Use for questions like 'how has NVDA done this year', '1-year movement of STX', 'YTD performance'.",
+      inputSchema: z.object({
+        ticker: z.string().min(1).max(10),
+        range: z.enum(["1mo", "3mo", "6mo", "1y", "2y", "5y", "ytd", "max"]).default("1y"),
+      }),
+      execute: async ({ ticker, range }) => {
+        const symbol = ticker.toUpperCase();
+        const t0 = Date.now();
+        try {
+          const data = await fetchJSON<{
+            chart?: {
+              result?: Array<{
+                meta?: { currency?: string; symbol?: string };
+                timestamp?: number[];
+                indicators?: { quote?: Array<{ close?: (number | null)[]; high?: (number | null)[]; low?: (number | null)[] }> };
+              }>;
+              error?: { description?: string } | null;
+            };
+          }>(
+            `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=1d`,
+            { headers: { "user-agent": "Mozilla/5.0 lekha-bot/1.0" } },
+          );
+          console.log("[stock_history]", { ticker: symbol, range, ms: Date.now() - t0 });
+          if (data.chart?.error) return { ok: false, error: `Yahoo: ${data.chart.error.description}` };
+          const result = data.chart?.result?.[0];
+          const closes = (result?.indicators?.quote?.[0]?.close ?? []).filter((v): v is number => v != null);
+          const highs = (result?.indicators?.quote?.[0]?.high ?? []).filter((v): v is number => v != null);
+          const lows = (result?.indicators?.quote?.[0]?.low ?? []).filter((v): v is number => v != null);
+          const ts = result?.timestamp ?? [];
+          if (closes.length < 2 || ts.length < 2) {
+            return { ok: false, error: `Not enough history for ${symbol}` };
+          }
+          const first = closes[0]!;
+          const last = closes[closes.length - 1]!;
+          const change = last - first;
+          const changePct = (change / first) * 100;
+          return {
+            ok: true,
+            symbol,
+            range,
+            currency: result?.meta?.currency ?? "USD",
+            firstDate: new Date(ts[0]! * 1000).toISOString().slice(0, 10),
+            lastDate: new Date(ts[ts.length - 1]! * 1000).toISOString().slice(0, 10),
+            firstPrice: first,
+            lastPrice: last,
+            highPrice: Math.max(...highs),
+            lowPrice: Math.min(...lows),
+            change,
+            changePercent: changePct,
+            samples: closes.length,
+          };
+        } catch (err) {
+          return { ok: false, error: `History lookup failed: ${err instanceof Error ? err.message : String(err)}` };
+        }
+      },
+    }),
+
     crypto_price: tool({
       description:
         "Get the current USD price + 24h change for a cryptocurrency by CoinGecko id (bitcoin, ethereum, solana, etc.) or common ticker (btc, eth, sol). Fast (<1s). Use this for ANY crypto-price question.",

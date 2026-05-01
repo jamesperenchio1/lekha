@@ -399,7 +399,8 @@ async function runAgent(
 
 You have these tools available right now — use them whenever the user's request matches. NEVER reply 'I don't have access to X' if a matching tool exists below; CALL the tool:
 
-- stock_price(ticker)         — current stock price (NVDA, AAPL, TSLA, …). USE THIS for any stock question.
+- stock_price(ticker)         — current stock price.
+- stock_history(ticker, range) — historical movement: 1mo / 3mo / 6mo / 1y / 2y / 5y / ytd / max. USE for "1-year movement of X" / "YTD performance".
 - crypto_price(coin)          — current crypto price (bitcoin, ethereum, btc, eth, …). USE THIS for any crypto question.
 - fx_rate(from, to, amount)   — currency conversion. USE THIS for any FX question.
 - weather(location)           — current weather + 3-day forecast. USE THIS for any weather question.
@@ -607,7 +608,7 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
           },
         },
       }),
-      45_000,
+      60_000,
     );
     console.log("[agent] gemini done", { ms: Date.now() - tStart, steps: r.steps.length });
     return r;

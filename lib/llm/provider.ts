@@ -40,12 +40,14 @@ export function fallbackChatModels() {
   const g = groqClient();
   if (!g) return [];
   return [
-    // gpt-oss-120b is the most reliable at JSON tool-calling; with the slim
-    // prompt the request fits under its 8K TPM ceiling.
+    // qwen3-32b: 60K TPM on Groq free tier, strong JSON tool-calling support.
+    // Best fit for big multi-tool agentic turns.
+    g("qwen/qwen3-32b"),
+    // gpt-oss-120b: very reliable at tool calls but tight 8K TPM ceiling.
+    // Works for small requests; falls back when slim prompt overflows.
     g("openai/gpt-oss-120b"),
-    // Llama 4 has more TPM headroom but occasionally refuses tool use
-    // ("I don't have access to X") when not heavily prompted.
-    g("meta-llama/llama-4-maverick-17b-128e-instruct"),
+    // llama-4-scout: 30K TPM, sometimes writes tool args as plain text instead
+    // of calling the tool — last resort.
     g("meta-llama/llama-4-scout-17b-16e-instruct"),
   ];
 }

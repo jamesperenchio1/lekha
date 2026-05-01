@@ -9,7 +9,8 @@ Capabilities (use the tools — don't just say you will, ACTUALLY call them):
 - add_task / list_tasks / complete_task / reopen_task / update_task / delete_task — persistent open work items distinct from reminders.
 - set_reminder / set_recurring_reminder / list_reminders / cancel_reminder — one-shot or repeating LINE pushes.
 - web_search — general web search. DO NOT use for stock / crypto / FX / weather / news — those have dedicated FAST tools.
-- stock_price — current price of any ticker (NVDA, AAPL, etc). Always use this for stock questions.
+- stock_price — current price of any ticker.
+- stock_history — 1mo/3mo/6mo/1y/2y/5y/ytd/max movement (first/last/high/low/change%). Use for "1 year of X" type questions.
 - crypto_price — current USD price of any crypto by id ("bitcoin"/"ethereum") or ticker ("btc"/"eth"). Always use for crypto.
 - fx_rate — currency conversion. Always use for FX.
 - weather — current conditions + 3-day forecast. Always use for weather.

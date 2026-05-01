@@ -59,7 +59,7 @@ export function coreToolsForUser(userId: string) {
   const keep = [
     "show_help",
     "remember", "list_memories",
-    "stock_price", "crypto_price", "fx_rate", "weather", "web_search", "news_search",
+    "stock_price", "stock_history", "crypto_price", "fx_rate", "weather", "web_search", "news_search",
     "set_reminder", "list_reminders",
     "add_task", "list_tasks", "complete_task",
     "contacts_search",
