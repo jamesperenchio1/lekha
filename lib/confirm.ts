@@ -10,7 +10,6 @@ export type SendEmailAction = {
   subject: string;
   body: string;
   fromEmail?: string;
-  /** Drive file IDs to attach. The bot fetches their bytes at send time. */
   attachments?: { fileId: string; fromEmail?: string }[];
 };
 
@@ -29,18 +28,22 @@ export type PendingAction = SendEmailAction | CreateCalendarEventAction;
 
 const key = (userId: string) => `pending:${userId}`;
 
-/** Append an action to the pending queue (TTL 5 min). */
+/**
+ * Append an action to the pending queue ATOMICALLY.
+ * Uses RPUSH so concurrent tool calls in the same agent turn don't race
+ * (which would make one of them silently overwrite the other).
+ */
 export async function appendPending(userId: string, action: PendingAction): Promise<void> {
-  const existing = await getPending(userId);
-  const next = [...existing, action];
-  await redis().set(key(userId), next, { ex: TTL_SEC });
+  const k = key(userId);
+  const tx = redis().multi();
+  tx.rpush(k, JSON.stringify(action));
+  tx.expire(k, TTL_SEC);
+  await tx.exec();
 }
 
 export async function getPending(userId: string): Promise<PendingAction[]> {
-  const v = await redis().get<PendingAction[] | PendingAction>(key(userId));
-  if (!v) return [];
-  // Backward compat: previous schema stored a single object.
-  return Array.isArray(v) ? v : [v];
+  const raw = await redis().lrange<string | PendingAction>(key(userId), 0, -1);
+  return raw.map((r) => (typeof r === "string" ? (JSON.parse(r) as PendingAction) : r));
 }
 
 export async function clearPending(userId: string): Promise<void> {

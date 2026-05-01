@@ -41,8 +41,9 @@ async function executeOne(userId: string, action: PendingAction): Promise<string
   if (action.kind === "create_calendar_event") {
     try {
       const r = await createCalendarEvent(userId, action);
-      const intro = `✅ Added to your ${r.from} calendar.`;
-      return r.htmlLink ? `${intro}\n${r.htmlLink}` : intro;
+      const intro = `✅ Added to ${r.from}'s calendar.`;
+      const hint = `(open the link below while signed into Google as ${r.from} — otherwise Google will say "event not found")`;
+      return r.htmlLink ? `${intro}\n${hint}\n${r.htmlLink}` : intro;
     } catch (err) {
       if (unwrapAuthRequired(err)) {
         return `I need Google access first. Connect here:\n${buildConnectUrl(userId)}`;
