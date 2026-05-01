@@ -181,7 +181,7 @@ async function respondToText(
   profile: { displayName: string },
   userText: string,
 ): Promise<void> {
-  await showLoading(userId, 20);
+  await showLoading(userId, 60);
 
   const history = await loadHistory(userId);
   const facts = await loadFacts(userId);
@@ -205,7 +205,7 @@ async function respondToImage(
   profile: { displayName: string },
   messageId: string,
 ): Promise<void> {
-  await showLoading(userId, 25);
+  await showLoading(userId, 60);
 
   let imagePart: { type: "image"; image: Uint8Array; mediaType: string };
   try {
@@ -255,7 +255,7 @@ async function respondToOtherMedia(
   fileSize: number | undefined,
   durationMs: number | undefined,
 ): Promise<void> {
-  await showLoading(userId, 15);
+  await showLoading(userId, 60);
 
   // We don't fetch the bytes now — just record the LINE pointer + metadata.
   // Bytes are pulled at send time (cheap, avoids burning Redis on big files).
@@ -464,14 +464,20 @@ async function runAgent(
     if (inner instanceof RateLimited) {
       return `I'm being rate-limited. Try again in ~${inner.retryAfterSec}s.`;
     }
-    // Surface known Gemini rate-limit errors with a clean retry-after message.
+    // Hard-timeout (the model itself was stuck) — distinct, actionable message.
+    if (err instanceof AgentTimeoutError) {
+      console.warn("[agent] timeout", { seconds: err.seconds });
+      return `That took longer than ${err.seconds}s and I had to bail. Try a simpler version of the request, or try again in a sec.`;
+    }
+    // Known Gemini rate-limit / overload errors with a clean retry-after message.
     const quota = parseQuotaError(err);
     if (quota) {
-      console.warn("[agent] gemini quota hit", { retryAfter: quota.retryAfterSec });
-      return `I'm out of free Gemini quota for the next ~${quota.retryAfterSec}s. Try again then.`;
+      console.warn("[agent] gemini quota/overload hit", { retryAfter: quota.retryAfterSec });
+      return `I'm out of free Gemini capacity for the next ~${quota.retryAfterSec}s (and Groq couldn't pick up either). Try again then.`;
     }
     console.error("[agent] unhandled", err);
-    return "Something went sideways on my end. Try again in a moment?";
+    const errClass = err instanceof Error ? ` (${err.name})` : "";
+    return `Something went sideways on my end${errClass}. Try again in a moment?`;
   }
 }
 
@@ -493,42 +499,53 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   tools: T;
 }) {
   try {
-    return await generateText({
-      model: chatModel(),
-      system: opts.system,
-      messages: opts.messages,
-      tools: opts.tools,
-      stopWhen: stepCountIs(8),
-      maxRetries: 0,
-      providerOptions: {
-        google: {
-          safetySettings: [
-            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-          ],
-        },
-      },
-    });
-  } catch (err) {
-    const quota = parseQuotaError(err);
-    if (!quota) throw err;
-    const fallback = fallbackChatModel();
-    if (!fallback || opts.hasMultimodal) throw err;
-    console.warn("[agent] gemini quota — instant fallback to groq", { retryAfter: quota.retryAfterSec });
-    try {
-      return await generateText({
-        model: fallback as LanguageModel,
+    return await withTimeout(
+      generateText({
+        model: chatModel(),
         system: opts.system,
         messages: opts.messages,
         tools: opts.tools,
-        stopWhen: stepCountIs(6),
+        stopWhen: stepCountIs(8),
         maxRetries: 0,
-      });
+        providerOptions: {
+          google: {
+            safetySettings: [
+              { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+              { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+              { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+              { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+            ],
+          },
+        },
+      }),
+      30_000,
+    );
+  } catch (err) {
+    const isTimeout = err instanceof AgentTimeoutError;
+    const quota = parseQuotaError(err);
+    // Cascade on quota/overload/transient AND on hard timeouts (a stuck Gemini call).
+    if (!quota && !isTimeout) throw err;
+    const fallback = fallbackChatModel();
+    if (!fallback || opts.hasMultimodal) throw err;
+    console.warn(
+      "[agent] cascading to groq",
+      isTimeout ? "(gemini timeout)" : `(gemini quota/overload, retry-after ~${quota?.retryAfterSec}s)`,
+    );
+    try {
+      return await withTimeout(
+        generateText({
+          model: fallback as LanguageModel,
+          system: opts.system,
+          messages: opts.messages,
+          tools: opts.tools,
+          stopWhen: stepCountIs(6),
+          maxRetries: 0,
+        }),
+        30_000,
+      );
     } catch (groqErr) {
       console.error("[agent] groq fallback also failed", groqErr instanceof Error ? `${groqErr.name}: ${groqErr.message}` : groqErr);
-      throw err; // surface the original quota message to the user
+      throw err; // surface the original error to the user-facing catch
     }
   }
 }
@@ -557,10 +574,34 @@ function parseQuotaError(err: unknown): { retryAfterSec: number } | null {
       return String(err);
     }
   })();
-  if (!/quota|rate.?limit|RESOURCE_EXHAUSTED|429/i.test(text)) return null;
+  // Match real quota AND transient overload — both are signals to cascade.
+  if (
+    !/quota|rate.?limit|RESOURCE_EXHAUSTED|429|UNAVAILABLE|overloaded|503|INTERNAL|timeout|temporarily/i.test(
+      text,
+    )
+  ) {
+    return null;
+  }
   const m = text.match(/retry in (\d+(?:\.\d+)?)s/i);
-  const retryAfterSec = m ? Math.ceil(parseFloat(m[1]!)) : 60;
+  const retryAfterSec = m ? Math.ceil(parseFloat(m[1]!)) : 30;
   return { retryAfterSec };
+}
+
+class AgentTimeoutError extends Error {
+  constructor(public readonly seconds: number) {
+    super(`Agent call exceeded ${seconds}s`);
+    this.name = "AgentTimeoutError";
+  }
+}
+
+/** Race a promise against a timeout. Throws AgentTimeoutError on timeout. */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new AgentTimeoutError(Math.round(ms / 1000))), ms),
+    ),
+  ]);
 }
 
 function unwrap(err: unknown): unknown {
