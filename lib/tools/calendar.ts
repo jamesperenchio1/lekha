@@ -2,7 +2,10 @@ import { z } from "zod";
 import { tool } from "ai";
 import { google } from "googleapis";
 import { getGoogleClient } from "./google-auth";
+import { withGoogleClient } from "./with-google";
 import { setPending, type CreateCalendarEventAction } from "@/lib/confirm";
+
+const CAL_SCOPE = "https://www.googleapis.com/auth/calendar.events";
 
 export function buildCalendarTools(userId: string) {
   return {
@@ -48,27 +51,29 @@ export function buildCalendarTools(userId: string) {
         fromEmail: z.string().email().optional(),
       }),
       execute: async ({ days, fromEmail }) => {
-        const { client } = await getGoogleClient(userId, fromEmail);
-        const calendar = google.calendar({ version: "v3", auth: client });
-        const now = new Date();
-        const max = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
-        const r = await calendar.events.list({
-          calendarId: "primary",
-          timeMin: now.toISOString(),
-          timeMax: max.toISOString(),
-          singleEvents: true,
-          orderBy: "startTime",
-          maxResults: 10,
+        return withGoogleClient(userId, fromEmail, [CAL_SCOPE], async ({ client }) => {
+          const calendar = google.calendar({ version: "v3", auth: client });
+          const now = new Date();
+          const max = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+          const r = await calendar.events.list({
+            calendarId: "primary",
+            timeMin: now.toISOString(),
+            timeMax: max.toISOString(),
+            singleEvents: true,
+            orderBy: "startTime",
+            maxResults: 10,
+          });
+          return {
+            ok: true as const,
+            events:
+              r.data.items?.map((e) => ({
+                summary: e.summary ?? "(no title)",
+                start: e.start?.dateTime ?? e.start?.date ?? "",
+                end: e.end?.dateTime ?? e.end?.date ?? "",
+                location: e.location ?? null,
+              })) ?? [],
+          };
         });
-        return {
-          events:
-            r.data.items?.map((e) => ({
-              summary: e.summary ?? "(no title)",
-              start: e.start?.dateTime ?? e.start?.date ?? "",
-              end: e.end?.dateTime ?? e.end?.date ?? "",
-              location: e.location ?? null,
-            })) ?? [],
-        };
       },
     }),
   };

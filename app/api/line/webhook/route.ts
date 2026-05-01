@@ -243,19 +243,34 @@ async function runAgent(
       },
     });
 
-    // Collect tool calls across steps for canonical draft rendering.
+    // Collect tool calls + outputs across steps.
     const allCalls: { toolName: string; input: unknown }[] = [];
+    let authNeeded: { connectUrl: string; reason: string } | null = null;
     for (const step of result.steps) {
       for (const c of step.toolCalls) {
         if (!c) continue;
         allCalls.push({ toolName: c.toolName, input: c.input });
       }
+      for (const tr of step.toolResults) {
+        if (!tr) continue;
+        const out = (tr as { output?: unknown }).output;
+        // Tools return { need_google_auth: true, connect_url, reason } via withGoogleClient.
+        const value = extractToolValue(out);
+        if (value && typeof value === "object" && (value as { need_google_auth?: boolean }).need_google_auth) {
+          const v = value as { connect_url?: string; reason?: string };
+          if (v.connect_url) authNeeded = { connectUrl: v.connect_url, reason: v.reason ?? "" };
+        }
+      }
     }
-    const draftBlock = renderDraftsBlock(allCalls, accounts.activeEmail);
 
+    if (authNeeded) {
+      // Override the model's reply — the user MUST see the connect link.
+      return `I need to (re)authorize your Google account first — the existing token is missing the right scopes.\n\n${authNeeded.connectUrl}\n\n(Link expires in 10 min. After you connect, I'll automatically pick up where we left off.)`;
+    }
+
+    const draftBlock = renderDraftsBlock(allCalls, accounts.activeEmail);
     const modelText = result.text?.trim() ?? "";
     if (draftBlock) {
-      // Verbatim draft is the source of truth. Keep model intro short, append draft.
       const intro = modelText.length > 0 && modelText.length < 240 ? `${modelText}\n\n` : "";
       return `${intro}${draftBlock}`;
     }
@@ -282,6 +297,17 @@ async function runAgent(
     console.error("[agent] unhandled", err);
     return "Something went sideways on my end. Try again in a moment?";
   }
+}
+
+/** Extract the actual value from an AI SDK tool result output, which can be
+ * either { type: 'json', value } or just a value depending on shape. */
+function extractToolValue(output: unknown): unknown {
+  if (output && typeof output === "object") {
+    const o = output as { type?: string; value?: unknown };
+    if (o.type === "json" && "value" in o) return o.value;
+    return output;
+  }
+  return output;
 }
 
 function parseQuotaError(err: unknown): { retryAfterSec: number } | null {
