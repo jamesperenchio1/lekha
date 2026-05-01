@@ -246,6 +246,8 @@ async function runAgent(
     // Collect tool calls + outputs across steps.
     const allCalls: { toolName: string; input: unknown }[] = [];
     let authNeeded: { connectUrl: string; reason: string } | null = null;
+    let apiDisabled: { api: string; enableUrl: string | null; message: string } | null = null;
+    let googleErr: { status: number | null; message: string } | null = null;
     for (const step of result.steps) {
       for (const c of step.toolCalls) {
         if (!c) continue;
@@ -253,19 +255,39 @@ async function runAgent(
       }
       for (const tr of step.toolResults) {
         if (!tr) continue;
-        const out = (tr as { output?: unknown }).output;
-        // Tools return { need_google_auth: true, connect_url, reason } via withGoogleClient.
-        const value = extractToolValue(out);
-        if (value && typeof value === "object" && (value as { need_google_auth?: boolean }).need_google_auth) {
-          const v = value as { connect_url?: string; reason?: string };
-          if (v.connect_url) authNeeded = { connectUrl: v.connect_url, reason: v.reason ?? "" };
+        const value = extractToolValue((tr as { output?: unknown }).output);
+        if (!value || typeof value !== "object") continue;
+        const v = value as Record<string, unknown>;
+        if (v.need_google_auth && typeof v.connect_url === "string") {
+          authNeeded = { connectUrl: v.connect_url, reason: typeof v.reason === "string" ? v.reason : "" };
+        } else if (v.google_api_disabled) {
+          apiDisabled = {
+            api: typeof v.api === "string" ? v.api : "Google API",
+            enableUrl: typeof v.enable_url === "string" ? v.enable_url : null,
+            message: typeof v.message === "string" ? v.message : "",
+          };
+        } else if (v.google_error) {
+          googleErr = {
+            status: typeof v.status === "number" ? v.status : null,
+            message: typeof v.message === "string" ? v.message : "",
+          };
         }
       }
     }
 
+    // Override priority: auth → API disabled → other Google error.
     if (authNeeded) {
-      // Override the model's reply — the user MUST see the connect link.
-      return `I need to (re)authorize your Google account first — the existing token is missing the right scopes.\n\n${authNeeded.connectUrl}\n\n(Link expires in 10 min. After you connect, I'll automatically pick up where we left off.)`;
+      return `I need to (re)authorize your Google account first — the stored token is missing the required scopes.\n\n${authNeeded.connectUrl}\n\n(Link expires in 10 min. After you connect, I'll pick up where we left off automatically.)`;
+    }
+    if (apiDisabled) {
+      const enableHint = apiDisabled.enableUrl
+        ? `\n\nEnable it here:\n${apiDisabled.enableUrl}`
+        : `\n\nEnable it in Google Cloud Console → APIs & Services → Library.`;
+      return `Google says the ${apiDisabled.api} isn't enabled in your Cloud project.${enableHint}\n\nGive it ~1 min to propagate after enabling, then try again.`;
+    }
+    if (googleErr) {
+      const status = googleErr.status ? ` (HTTP ${googleErr.status})` : "";
+      return `Google API error${status}: ${googleErr.message}`;
     }
 
     const draftBlock = renderDraftsBlock(allCalls, accounts.activeEmail);
