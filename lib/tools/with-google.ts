@@ -55,6 +55,17 @@ export async function withGoogleClient<T>(
           : "Need to authorize Google",
       };
     }
+    // Refresh-token failures from a swapped-out OAuth client look like 'invalid_grant'
+    // or 'invalid_client' — treat the same as needs-reauth.
+    const msg = String((err as { message?: unknown })?.message ?? err);
+    if (/invalid_grant|invalid_client|Token has been expired or revoked|unauthorized_client/i.test(msg)) {
+      return {
+        ok: false,
+        need_google_auth: true,
+        connect_url: buildConnectUrl(userId),
+        reason: "Stored Google token is no longer valid (probably issued by a previous OAuth client) — please reconnect.",
+      };
+    }
     return classifyGoogleError(err);
   }
 }
