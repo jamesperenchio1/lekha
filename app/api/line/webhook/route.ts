@@ -13,7 +13,8 @@ import { env } from "@/lib/env";
 import { redis } from "@/lib/memory/redis";
 import { appendTurn, loadHistory, turnCounter } from "@/lib/memory/history";
 import { loadFacts, factsToPromptBlock } from "@/lib/memory/facts";
-import { getOrCreateProfile, isFirstContact } from "@/lib/memory/profile";
+import { getOrCreateProfile } from "@/lib/memory/profile";
+import { isAllowed, addToAllowlist, removeFromAllowlist, listAllowed } from "@/lib/memory/allowlist";
 import { chatModel, fallbackChatModels } from "@/lib/llm/provider";
 import { isGeminiDown, markGeminiDown } from "@/lib/llm/health";
 import type { LanguageModel } from "ai";
@@ -72,13 +73,34 @@ async function handleEvent(event: LineEvent): Promise<void> {
     if (set === null) return;
   }
 
+  // Allowlist gate — runs for every event type before any other logic.
+  // Admin always passes. Everyone else must be on the allowlist.
+  const adminId = env().ADMIN_LINE_USER_ID;
+  const eventUserId = event.source?.userId;
+  if (eventUserId && adminId && eventUserId !== adminId) {
+    const allowed = await isAllowed(eventUserId);
+    if (!allowed) {
+      if ("replyToken" in event && event.replyToken) {
+        await reply(event.replyToken, [
+          textMsg(`This is a private assistant.\n\nYour LINE ID:\n${eventUserId}\n\nSend this to the admin to request access.`),
+        ]);
+      }
+      return;
+    }
+  }
+
   if (event.type === "follow") {
     const userId = event.source?.userId;
     if (!userId || !("replyToken" in event)) return;
-    await getOrCreateProfile(userId);
+    const profile = await getOrCreateProfile(userId);
+    const name = profile.displayName && profile.displayName !== "friend" ? ` ${profile.displayName}` : "";
+    const connectUrl = await buildConnectUrl(userId).catch(() => null);
+    const connectLine = connectUrl
+      ? `\n\n🔗 Connect Google (Gmail, Calendar, Drive):\n${connectUrl}`
+      : "";
     await reply(event.replyToken, [
       textMsg(
-        "Hi! I'm Lekha, your personal assistant. I can chat, remember things you tell me, set reminders, search the web, look at photos, and (after you connect Google) send email and add to your calendar. Try: \"remind me in 5 minutes to stretch\".",
+        `Hi${name}! I'm Lekha, your personal assistant 👋\n\nI can set reminders, search the web, look up stocks or weather, read photos, and more. Once you connect Google I can also send email and manage your calendar.\n\nType "help" to see everything I can do.${connectLine}`,
       ),
     ]);
     return;
@@ -91,11 +113,15 @@ async function handleEvent(event: LineEvent): Promise<void> {
   if (!("replyToken" in event) || !("message" in event)) return;
   const message = event.message;
 
-  // Register so the proactive cron sweep knows about this user.
-  await registerUser(userId).catch(() => {});
+  // Run all independent setup in parallel: rate limit, profile, pending queue.
+  // registerUser is fire-and-forget — cron sweep needs it but nothing here depends on it.
+  registerUser(userId).catch(() => {});
+  const [rl, profile, pending] = await Promise.all([
+    checkRateLimit(userId),
+    getOrCreateProfile(userId),
+    getPending(userId),
+  ]);
 
-  // Rate limit (per LINE userId).
-  const rl = await checkRateLimit(userId);
   if (!rl.ok) {
     await reply(event.replyToken, [
       textMsg(`Easy there — give me a sec. Try again in ~${rl.retryAfterSec}s.`),
@@ -103,18 +129,10 @@ async function handleEvent(event: LineEvent): Promise<void> {
     return;
   }
 
-  // First contact: greet + record profile, but still process the message below.
-  if (await isFirstContact(userId)) {
-    await getOrCreateProfile(userId);
-  }
-  const profile = await getOrCreateProfile(userId);
-
   // Handle text messages (with confirmation routing).
   if (message.type === "text" && "text" in message && typeof message.text === "string") {
     const userText = message.text.trim();
 
-    // If pending actions are awaiting confirmation, intercept.
-    const pending = await getPending(userId);
     if (pending.length > 0) {
       const decision = classify(userText);
       if (decision === "yes") {
@@ -135,6 +153,42 @@ async function handleEvent(event: LineEvent): Promise<void> {
       }
       // Otherwise: discard the pending list and let the model handle the new instruction.
       await clearPending(userId);
+    }
+
+    // /myid — lets anyone look up their own LINE userId (needed to request allowlist access).
+    if (/^\/myid$/i.test(userText)) {
+      await reply(event.replyToken, [textMsg(`Your LINE ID:\n${userId}`)]);
+      return;
+    }
+
+    // Admin-only management commands.
+    if (adminId && userId === adminId) {
+      const addMatch = userText.match(/^\/allow\s+(U\w+)$/i);
+      const remMatch = userText.match(/^\/remove\s+(U\w+)$/i);
+      if (addMatch) {
+        await addToAllowlist(addMatch[1]!);
+        await reply(event.replyToken, [textMsg(`✅ Added ${addMatch[1]} to the allowlist.`)]);
+        return;
+      }
+      if (remMatch) {
+        await removeFromAllowlist(remMatch[1]!);
+        await reply(event.replyToken, [textMsg(`🗑 Removed ${remMatch[1]} from the allowlist.`)]);
+        return;
+      }
+      if (/^\/users$/i.test(userText)) {
+        const list = await listAllowed();
+        const body = list.length ? list.join("\n") : "(nobody yet)";
+        await reply(event.replyToken, [textMsg(`Allowed users (${list.length}):\n\n${body}`)]);
+        return;
+      }
+    }
+
+    // Shortcut: help command never needs an LLM call.
+    const helpTrigger = /^\/?(help|what can you do|capabilities)$/i;
+    if (helpTrigger.test(userText)) {
+      const { HELP_TEXT } = await import("@/lib/tools/help");
+      await reply(event.replyToken, [textMsg(HELP_TEXT)]);
+      return;
     }
 
     await respondToText(event.replyToken, userId, profile, userText);
@@ -182,10 +236,10 @@ async function respondToText(
   profile: { displayName: string },
   userText: string,
 ): Promise<void> {
-  await showLoading(userId, 60);
-
-  const history = await loadHistory(userId);
-  const facts = await loadFacts(userId);
+  const t0 = Date.now();
+  showLoading(userId, 60).catch(() => {});  // fire-and-forget; LLM doesn't wait for LINE ack
+  const [history, facts] = await Promise.all([loadHistory(userId), loadFacts(userId)]);
+  console.log("[webhook] preload done", { ms: Date.now() - t0 });
   const messages: ModelMessage[] = [
     ...history.map<ModelMessage>((t) => ({ role: t.role, content: t.content })),
     { role: "user", content: userText },
@@ -206,8 +260,8 @@ async function respondToImage(
   profile: { displayName: string },
   messageId: string,
 ): Promise<void> {
-  await showLoading(userId, 60);
-
+  const t0 = Date.now();
+  showLoading(userId, 60).catch(() => {});
   let imagePart: { type: "image"; image: Uint8Array; mediaType: string };
   try {
     const { bytes, contentType } = await getMessageContent(messageId);
@@ -225,8 +279,8 @@ async function respondToImage(
     return;
   }
 
-  const history = await loadHistory(userId);
-  const facts = await loadFacts(userId);
+  const [history, facts] = await Promise.all([loadHistory(userId), loadFacts(userId)]);
+  console.log("[webhook] preload done", { ms: Date.now() - t0 });
   const messages: ModelMessage[] = [
     ...history.map<ModelMessage>((t) => ({ role: t.role, content: t.content })),
     {
@@ -395,7 +449,8 @@ async function runAgent(
   // will refuse a request with "I don't have access to X" if the tool isn't
   // mentioned in the system prompt — even though the schema IS being passed to
   // them through the API. Listing them here forces the model to actually use them.
-  const slimSystem = `You are Lekha, ${profile.displayName}'s personal assistant on LINE. Be direct, useful, concise (1-3 sentences). Match the user's language. Current time: ${new Date().toISOString()} (UTC).
+  const slimLocationHint = settings?.location ? `\nUser's location: ${settings.location}.` : "";
+  const slimSystem = `You are Lekha, ${profile.displayName}'s personal assistant on LINE. Be direct, useful, concise (1-3 sentences). Match the user's language. Current time: ${new Date().toISOString()} (UTC).${slimLocationHint}
 
 You have these tools available right now — use them whenever the user's request matches. NEVER reply 'I don't have access to X' if a matching tool exists below; CALL the tool:
 
@@ -403,7 +458,7 @@ You have these tools available right now — use them whenever the user's reques
 - stock_history(ticker, range) — historical movement: 1mo / 3mo / 6mo / 1y / 2y / 5y / ytd / max. USE for "1-year movement of X" / "YTD performance".
 - crypto_price(coin)          — current crypto price (bitcoin, ethereum, btc, eth, …). USE THIS for any crypto question.
 - fx_rate(from, to, amount)   — currency conversion. USE THIS for any FX question.
-- weather(location)           — current weather + 3-day forecast. USE THIS for any weather question.
+- weather(location)           — current weather + 3-day forecast. USE THIS for any weather question. If no location is known, ASK the user before calling.
 - news_search(query, days?)   — recent news headlines + sources. USE THIS for any news question.
 - web_search(query)           — general web search for everything else (articles, who-is-X). NOT for stocks/crypto/weather/news.
 - set_reminder(when, message) — schedule a reminder push.
@@ -479,8 +534,35 @@ CRITICAL: when a tool returns { ok: false, error: "..." }, RELAY THE EXACT ERROR
       return `Google API error${status}: ${googleErr.message}`;
     }
 
+    // Collect tool errors. If the model soft-apologized instead of relaying the
+    // actual error, override with the real message so the user knows what broke.
+    const toolErrors: string[] = [];
+    for (const step of result.steps) {
+      for (const tr of step.toolResults) {
+        const value = extractToolValue((tr as { output?: unknown }).output);
+        if (value && typeof value === "object") {
+          const v = value as Record<string, unknown>;
+          if (v.ok === false && typeof v.error === "string") {
+            const toolName = (tr as { toolName?: string }).toolName ?? "tool";
+            toolErrors.push(`${toolName}: ${v.error}`);
+          }
+        }
+      }
+    }
+
     const draftBlock = renderDraftsBlock(allCalls, accounts.activeEmail);
     const modelText = result.text?.trim() ?? "";
+
+    // If there were tool errors and the model's response doesn't mention the actual
+    // error text (i.e. it soft-apologized), surface the real errors instead.
+    if (toolErrors.length > 0 && !draftBlock) {
+      const allErrorsPresent = toolErrors.every((e) => modelText.includes(e.split(": ").slice(1).join(": ")));
+      if (!allErrorsPresent) {
+        console.warn("[agent] model soft-apologized — overriding with real tool errors", toolErrors);
+        return toolErrors.join("\n");
+      }
+    }
+
     if (draftBlock) {
       const intro = modelText.length > 0 && modelText.length < 240 ? `${modelText}\n\n` : "";
       return `${intro}${draftBlock}`;
@@ -581,6 +663,7 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
     throw new Error("gemini-skipped");
   }
 
+  let geminiRanToolCalls = false;
   try {
     const r = await withTimeout(
       generateText({
@@ -591,9 +674,15 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
         stopWhen: stepCountIs(4),
         maxRetries: 0,
         onStepFinish: (step) => {
+          if (step.toolCalls.length > 0) geminiRanToolCalls = true;
           console.log("[agent] gemini step", {
             ms: Date.now() - tStart,
             toolCalls: step.toolCalls.map((c) => c?.toolName),
+            toolResults: step.toolResults.map((r) => ({
+              tool: (r as { toolName?: string }).toolName,
+              result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
+            })),
+            text: step.text?.slice(0, 200) || undefined,
             finish: step.finishReason,
           });
         },
@@ -608,7 +697,7 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
           },
         },
       }),
-      60_000,
+      12_000,
     );
     console.log("[agent] gemini done", { ms: Date.now() - tStart, steps: r.steps.length });
     return r;
@@ -619,6 +708,13 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
     if (!quota && !isTimeout && !isSkip) throw err;
     const fallbacks = fallbackChatModels();
     if (!fallbacks.length || opts.hasMultimodal) throw err;
+    // If Gemini already executed tool calls before timing out, the side effects
+    // (reminder scheduled, email drafted, etc.) already happened. Cascading to
+    // Groq would re-run those same tools and cause duplicates.
+    if (isTimeout && geminiRanToolCalls) {
+      console.warn("[agent] gemini timed out after tool calls — skipping cascade to avoid duplicates");
+      throw err;
+    }
     if (!isSkip) {
       // Mark Gemini down so the next ~60s of requests skip it.
       await markGeminiDown(60).catch(() => {});
@@ -654,6 +750,11 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
                 model: modelLabel,
                 ms: Date.now() - tGroq,
                 toolCalls: step.toolCalls.map((c) => c?.toolName),
+                toolResults: step.toolResults.map((r) => ({
+                  tool: (r as { toolName?: string }).toolName,
+                  result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
+                })),
+                text: step.text?.slice(0, 200) || undefined,
                 finish: step.finishReason,
               });
             },

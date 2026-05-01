@@ -37,6 +37,7 @@ const Env = z.object({
 
   // App
   APP_BASE_URL: z.string().url(),
+  ADMIN_LINE_USER_ID: z.string().optional(),
 });
 
 export type EnvShape = z.infer<typeof Env>;

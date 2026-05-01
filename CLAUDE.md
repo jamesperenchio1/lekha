@@ -1,6 +1,6 @@
 # Lekha — repo guide for Claude Code
 
-A personal AI assistant living in LINE. Public bot, per-user state, agentic tool use, proactive layer.
+A personal AI assistant living in LINE. **Private bot** (allowlist-gated), per-user state, agentic tool use, proactive layer.
 
 ## Stack at a glance
 
@@ -8,7 +8,7 @@ A personal AI assistant living in LINE. Public bot, per-user state, agentic tool
 |---|---|
 | Runtime | Next.js 16 App Router on Vercel Functions (Node.js, Fluid Compute) |
 | Language | TypeScript, strict, `noUncheckedIndexedAccess` on |
-| LLM | Vercel AI SDK v6 + `@ai-sdk/google` (`gemini-flash-latest` + `gemini-flash-lite-latest`) |
+| LLM | Vercel AI SDK v6 + `@ai-sdk/google` (Gemini Flash Lite primary) + `@ai-sdk/groq` (llama-4-scout → gpt-oss-120b fallback cascade) |
 | Memory / queues | Upstash Redis (Marketplace integration → `KV_*` env vars) |
 | Scheduled jobs | Upstash QStash (one-shot reminders, deferred emails, recurring schedules, cron sweep) |
 | Web search | Tavily |
@@ -22,7 +22,7 @@ npm run dev          # next dev (needs .env.local; pull via `vercel env pull`)
 npm run build        # production build (turbopack)
 npm run typecheck    # tsc --noEmit
 npx vercel deploy --prod --yes   # ship
-npx vercel logs lekha-iota.vercel.app   # tail prod logs (forward-only stream)
+npx vercel logs --no-follow --since 1h --no-branch --expand   # recent prod logs with full output
 ```
 
 ## Project layout
@@ -63,7 +63,8 @@ lib/
 │   ├── settings.ts                    # per-user tz/locale/loc/briefing prefs
 │   ├── tasks.ts                       # persistent open work items
 │   ├── sent-log.ts                    # audit log (last 200, 6 month TTL)
-│   └── user-registry.ts               # set of all known userIds for cron sweep
+│   ├── user-registry.ts               # set of all known userIds for cron sweep
+│   └── allowlist.ts                   # private access control — Redis set `users:allowed`
 └── tools/
     ├── index.ts                       # toolsForUser(userId) — registry, env-gated
     ├── help.ts                        # show_help text dump
@@ -84,6 +85,7 @@ lib/
     ├── media-ai.ts                    # transcribe/summarize_audio + ocr/summarize_image + summarize_document
     ├── sent-history.ts                # query the audit log
     ├── export.ts                      # JSON dump of all user data
+    ├── weather.ts                     # weather — wttr.in primary, Open-Meteo fallback (both keyless)
     └── staged-media.ts                # list / clear LINE media staged for attach/upload
 ```
 
@@ -131,6 +133,15 @@ Every fact-extraction cycle (every 10 turns) ALSO writes a 2-4 sentence chunk su
 ### 14. Email body is base64-encoded
 For Thai/UTF-8 fidelity. `Content-Transfer-Encoding: base64` on the text body part. Some MTAs corrupt non-ASCII under `7bit`.
 
+### 15. Private allowlist — `ADMIN_LINE_USER_ID` + `users:allowed` Redis set
+The bot is private by default. Every event hits the allowlist gate before any other logic. Admin (env var `ADMIN_LINE_USER_ID`) always passes. Others must be in the `users:allowed` Redis set. Admin commands: `/allow <userId>`, `/remove <userId>`, `/users`. Anyone can run `/myid` to get their own LINE userId. Blocked users see their userId in the rejection message so they can send it to the admin.
+
+### 16. LLM cascade — Gemini primary (12s timeout) → Groq fallback
+`runWithCascade` tries Gemini Flash Lite first. On quota/overload/timeout it falls to Groq (llama-4-scout-17b → gpt-oss-120b). Gemini is marked down for 60s after any failure so subsequent requests skip it. **Critical**: if Gemini executes tool calls before timing out, the cascade is skipped — cascading would re-run tools (e.g. schedule the same reminder twice). Groq uses a slim system prompt + core tool subset (~18 tools) to stay under tight TPM limits.
+
+### 17. Orchestrator-level error relay enforcement
+After `generateText`, `runAgent` scans all tool results for `{ ok: false, error: "..." }`. If the model soft-apologized instead of relaying the actual error (detected by checking whether the error text appears in the model's response), the orchestrator overrides the reply with the real error. This prevents models from hiding API failures behind generic apologies.
+
 ## Conventions
 
 - **No comments unless explaining a non-obvious WHY.**
@@ -171,6 +182,11 @@ For Thai/UTF-8 fidelity. `Content-Transfer-Encoding: base64` on the text body pa
 - **LINE doesn't bundle a caption with media.** Recent-media staging spans messages within 30-min TTL.
 - **`Content-Transfer-Encoding: 7bit` is invalid for UTF-8 bodies** (Thai, emoji). Use base64.
 - **OAuth state nonce + connect-link token must be atomically consumed** (GETDEL) — non-atomic GET+DEL has a replay window.
+- **Gemini timeout at 12s** — Gemini occasionally hangs for 45+ seconds on overloaded requests. 12s is enough for a healthy response; anything longer means Gemini is too slow and Groq is faster.
+- **qwen3-32b unusable on free Groq tier** — its TPM limit is 6000/min, our slim prompt alone is ~6500 tokens. Every request fails. Removed from cascade.
+- **Cascade dedup for side-effectful tools** — `geminiRanToolCalls` flag in `runWithCascade`. Set in `onStepFinish` when Gemini calls any tool. If Gemini times out after setting this flag, cascade is skipped. Without this, reminders / emails get executed twice.
+- **Pre-flight parallelization** — `checkRateLimit`, `getOrCreateProfile`, `getPending` run in parallel. `showLoading` (LINE API) is fire-and-forget. Saves ~400ms per request vs. sequential awaits.
+- **wttr.in is unreliable** — it's a personal project, goes down without warning (HTTP 500). Always have Open-Meteo as fallback. Both are keyless.
 
 ## Manual smoke tests
 See README.md "Manual smoke tests" — covers settings, tasks, contacts, gmail inbox, OCR/voice/PDF, scheduled email, sent history, briefing.

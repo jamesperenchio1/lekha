@@ -40,15 +40,12 @@ export function fallbackChatModels() {
   const g = groqClient();
   if (!g) return [];
   return [
-    // qwen3-32b: 60K TPM on Groq free tier, strong JSON tool-calling support.
-    // Best fit for big multi-tool agentic turns.
-    g("qwen/qwen3-32b"),
-    // gpt-oss-120b: very reliable at tool calls but tight 8K TPM ceiling.
-    // Works for small requests; falls back when slim prompt overflows.
-    g("openai/gpt-oss-120b"),
-    // llama-4-scout: 30K TPM, sometimes writes tool args as plain text instead
-    // of calling the tool — last resort.
+    // llama-4-scout: 30K TPM, completes multi-step tool calls reliably in 1-2s.
+    // Primary fallback — high TPM headroom means it handles full conversations.
     g("meta-llama/llama-4-scout-17b-16e-instruct"),
+    // gpt-oss-120b: 8K TPM ceiling — can handle single-step queries but hits
+    // the limit on second step if there's been recent usage. Last resort.
+    g("openai/gpt-oss-120b"),
   ];
 }
 
