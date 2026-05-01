@@ -18,7 +18,7 @@ import { chatModel, fallbackChatModels } from "@/lib/llm/provider";
 import type { LanguageModel } from "ai";
 import { buildSystemPrompt } from "@/lib/llm/prompts";
 import { extractAndMergeFacts } from "@/lib/llm/extract-facts";
-import { toolsForUser } from "@/lib/tools";
+import { toolsForUser, coreToolsForUser } from "@/lib/tools";
 import { GoogleAuthRequired, NeedsConfirmation, RateLimited } from "@/lib/errors";
 import { buildConnectUrl } from "@/lib/tools/google-auth";
 import { checkRateLimit } from "@/lib/ratelimit";
@@ -389,12 +389,19 @@ async function runAgent(
       }),
   );
 
+  // Build a minimal system prompt for the fallback path (no tool list bloat,
+  // no staged-media block, no facts). The full system prompt is ~5K tokens
+  // because of all the tool descriptions; the slim one is a few hundred.
+  const slimSystem = `You are Lekha, James's personal assistant on LINE. Be direct, useful, and concise (1-3 sentences typical). Match the user's language. The current time is ${new Date().toISOString()} (UTC). Use the available tools when an action is needed; otherwise answer from general knowledge.`;
+
   try {
     const result = await runWithCascade({
       hasMultimodal,
       system,
       messages,
       tools: toolsForUser(userId),
+      slimSystem,
+      slimTools: coreToolsForUser(userId),
     });
 
     // Collect tool calls + outputs across steps.
@@ -532,6 +539,9 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   system: string;
   messages: ModelMessage[];
   tools: T;
+  /** Optional slim variants used only on the Groq fallback path (saves TPM, helps weaker models). */
+  slimSystem?: string;
+  slimTools?: ReturnType<typeof coreToolsForUser>;
 }) {
   const tStart = Date.now();
   try {
@@ -576,6 +586,11 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
       isTimeout ? "(gemini timeout)" : `(gemini quota/overload, retry-after ~${quota?.retryAfterSec}s)`,
       { totalMs: Date.now() - tStart, fallbackModels: fallbacks.length },
     );
+    // On the fallback path, ship a slim system prompt + the core tool subset.
+    // The full registry is ~50 tools (~5K tokens of descriptions) which blows
+    // Groq's tighter TPM limits and confuses weaker models.
+    const slimSystem = opts.slimSystem ?? opts.system;
+    const slimTools = opts.slimTools ?? opts.tools;
     const groqErrors: { model: string; error: unknown }[] = [];
     for (const m of fallbacks) {
       const tGroq = Date.now();
@@ -587,9 +602,9 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
         const r = await withTimeout(
           generateText({
             model: m as LanguageModel,
-            system: opts.system,
+            system: slimSystem,
             messages: opts.messages,
-            tools: opts.tools,
+            tools: slimTools,
             stopWhen: stepCountIs(4),
             maxRetries: 0,
             onStepFinish: (step) => {

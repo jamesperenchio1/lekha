@@ -28,16 +28,21 @@ export function chatModel() {
 
 /**
  * Returns ordered list of Groq fallback models to try in sequence.
- * If one is unavailable / deprecated, the cascade walks to the next.
+ * If one is unavailable / hits a per-model rate limit, the cascade walks on.
  * NOTE: text-only — no multimodal. Caller must skip on image/audio/video turns.
+ *
+ * Order picked for current Groq free-tier headroom + tool-use reliability:
+ *   1. llama-4-maverick: 60K TPM (8× more than gpt-oss-120b), strong tool use
+ *   2. llama-4-scout:    30K TPM, smaller/faster
+ *   3. gpt-oss-120b:     8K TPM but very reliable when it fits
  */
 export function fallbackChatModels() {
   const g = groqClient();
   if (!g) return [];
   return [
-    g("openai/gpt-oss-120b"),               // Groq's strongest tool-using model right now
-    g("moonshotai/kimi-k2-instruct-0905"), // Kimi K2 — explicitly tuned for agents
-    g("llama-3.3-70b-versatile"),          // Fallback to the proven workhorse
+    g("meta-llama/llama-4-maverick-17b-128e-instruct"),
+    g("meta-llama/llama-4-scout-17b-16e-instruct"),
+    g("openai/gpt-oss-120b"),
   ];
 }
 

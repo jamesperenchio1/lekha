@@ -20,8 +20,8 @@ import { buildWeatherTools } from "./weather";
 import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 
 /**
- * Returns the tool registry bound to a single user. Tools that depend on
- * unconfigured services are omitted so the model doesn't try to use them.
+ * Returns the FULL tool registry bound to a single user. Used on the primary
+ * (Gemini) path. Tools that depend on unconfigured services are omitted.
  */
 export function toolsForUser(userId: string) {
   return {
@@ -45,4 +45,28 @@ export function toolsForUser(userId: string) {
     ...(hasGoogleOAuth() && hasQStash() ? buildScheduledEmailTools(userId) : {}),
     ...buildStagedMediaTools(userId),
   };
+}
+
+/**
+ * Slim registry for fallback path (Groq). Cuts the tool list from ~50 to ~12
+ * to stay under tight TPM limits and to be more legible to weaker models.
+ * Picks the tools that handle 90% of real requests; specialty tools are dropped.
+ */
+export function coreToolsForUser(userId: string) {
+  const all = toolsForUser(userId);
+  const keep = [
+    "show_help",
+    "remember", "list_memories",
+    "stock_price", "crypto_price", "fx_rate", "weather", "web_search",
+    "set_reminder", "list_reminders",
+    "add_task", "list_tasks", "complete_task",
+    "contacts_search",
+    "draft_email", "draft_calendar_event",
+    "ocr_image", "transcribe_audio",
+  ] as const;
+  const out: Record<string, unknown> = {};
+  for (const name of keep) {
+    if (name in all) out[name] = (all as Record<string, unknown>)[name];
+  }
+  return out as Pick<ReturnType<typeof toolsForUser>, (typeof keep)[number]>;
 }
