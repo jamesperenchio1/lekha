@@ -20,123 +20,163 @@ Save both for step 8.
 
 ## 2. LINE channel access token
 
-1. Go to <https://developers.line.biz/console/> → your provider → channel `2009944232`.
-2. **Messaging API** tab → scroll to **Channel access token** → click **Issue** (long-lived).
-3. Copy it — you only see it once. Save as `LINE_CHANNEL_ACCESS_TOKEN`.
-4. Same tab: scroll up, **disable** "Auto-reply messages" and "Greeting messages" (they conflict with the bot).
-5. **Webhook URL** field — leave empty for now; we'll set it after deploy (step 9).
+1. <https://developers.line.biz/console/> → your provider → channel `2009944232`.
+2. **Messaging API** tab → **Channel access token** → **Issue** (long-lived). Save as `LINE_CHANNEL_ACCESS_TOKEN`.
+3. Same tab: **disable** "Auto-reply messages" and "Greeting messages".
+4. Webhook URL — leave empty for now; we'll fill after deploy (step 9).
 
-The channel secret you already have: `185cd47094c024f97b846e7d73b4d16f`.
+Channel secret: `185cd47094c024f97b846e7d73b4d16f` (already known).
 
 ---
 
 ## 3. Google Cloud — OAuth + APIs
 
-1. <https://console.cloud.google.com/> → create a project (e.g. "lekha").
-2. **APIs & Services → Library** → enable:
+1. <https://console.cloud.google.com/> — sign in as the Google account you want to *own* the project.
+2. Top bar → **New Project** → name it `lekha`.
+3. **APIs & Services → Library** → enable ALL of:
    - Gmail API
    - Google Calendar API
-3. **OAuth consent screen**:
-   - User type: **External**, status: **Testing** (fine for personal/small use; up to 100 test users).
-   - App name: Lekha. Support email: your email. Developer email: same.
-   - Scopes: add `gmail.send` and `calendar.events`. (You can also add `openid email profile` — already in our default scope list.)
-   - Test users: add every Gmail address that will use the bot (otherwise OAuth blocks them).
-4. **Credentials → Create Credentials → OAuth client ID**:
-   - Type: **Web application**.
-   - Authorized redirect URI: `https://YOUR-VERCEL-URL/api/oauth/google/callback` — use the URL Vercel gives you in step 7. (You can edit this later; just remember to come back.)
-5. Save **Client ID** and **Client Secret** as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`.
+   - Google Drive API
+   - People API (for Contacts)
+4. **OAuth consent screen** → External / Testing.
+   - App name: `Lekha`. Support + dev email: yours.
+   - **Test users**: add every Gmail you'll OAuth into the bot from.
+5. **Credentials → Create Credentials → OAuth client ID** → **Web application**.
+   - Authorized redirect URI: `https://YOUR-VERCEL-URL/api/oauth/google/callback` (placeholder OK; you'll edit after step 8).
+   - Save Client ID + Client Secret.
 
 ---
 
 ## 4. Tavily (web search)
 
-1. <https://tavily.com/> → sign up (free tier: 1000 searches/mo).
-2. Copy API key. Save as `TAVILY_API_KEY`.
+<https://tavily.com/> → sign up (free 1000/mo). Save `TAVILY_API_KEY`.
 
 ---
 
-## 5. Vercel project
+## 5. Gemini API key (under the same Google account that owns the Cloud project!)
+
+<https://aistudio.google.com/app/apikey> → **Create API key**. Save `GEMINI_API_KEY`. Free tier is fine; consider enabling billing later for higher RPM.
+
+---
+
+## 6. Vercel project
 
 ```bash
-npx vercel link        # creates the project + links this directory
+npx vercel link
 ```
 
-Pick a project name (e.g. `lekha`). After linking, your prod URL is `https://lekha.vercel.app` (or whatever you chose). Update `APP_BASE_URL` and `GOOGLE_REDIRECT_URI` accordingly.
+Pick a name (e.g. `lekha`). Note the URL it gives you (e.g. `https://lekha-iota.vercel.app`). Use that everywhere `APP_BASE_URL` / `GOOGLE_REDIRECT_URI` appear.
 
 ---
 
-## 6. Provision storage via Vercel Marketplace
+## 7. Provision storage via Vercel Marketplace
 
-From the Vercel dashboard → your project → **Storage** tab:
+Vercel dashboard → your project → **Storage** tab:
 
-1. **Add Integration → Upstash → Redis**. Pick the closest region. After install, env vars `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` auto-link.
-2. **Add Integration → Upstash → QStash**. Auto-links `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY`.
+1. **Add Integration → Upstash → Redis** (KV product). Auto-injects `KV_REST_API_URL` / `KV_REST_API_TOKEN`.
+2. **Add Integration → Upstash → QStash**. Auto-injects `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY`, `QSTASH_URL`.
 
-(Both have generous free tiers.)
+Both have generous free tiers.
 
 ---
 
-## 7. Set the rest of the env vars
+## 8. Push the rest of the env vars
 
 ```bash
 vercel env add LINE_CHANNEL_SECRET production preview development
 vercel env add LINE_CHANNEL_ACCESS_TOKEN production preview development
-vercel env add GEMINI_API_KEY production preview development         # from https://aistudio.google.com/app/apikey
+vercel env add GEMINI_API_KEY production preview development
 vercel env add GOOGLE_CLIENT_ID production preview development
 vercel env add GOOGLE_CLIENT_SECRET production preview development
-vercel env add GOOGLE_REDIRECT_URI production preview development    # https://your-app.vercel.app/api/oauth/google/callback
+vercel env add GOOGLE_REDIRECT_URI production preview development   # https://your-app.vercel.app/api/oauth/google/callback
 vercel env add TAVILY_API_KEY production preview development
 vercel env add TOKEN_ENCRYPTION_KEY production preview development
 vercel env add OAUTH_STATE_SECRET production preview development
-vercel env add APP_BASE_URL production preview development           # https://your-app.vercel.app
+vercel env add APP_BASE_URL production preview development          # https://your-app.vercel.app
 ```
 
-Then pull them locally for dev:
+(The current Vercel CLI requires one env per call — repeat for each.)
 
-```bash
-vercel env pull .env.local
-```
+Pull locally for dev: `vercel env pull .env.local`.
 
 ---
 
-## 8. Deploy
+## 9. Deploy
 
 ```bash
 vercel deploy --prod
 ```
 
-Note the deployed URL.
+Note the URL. Make sure it matches what you set as `APP_BASE_URL` and `GOOGLE_REDIRECT_URI`. If not, update those env vars and redeploy.
 
 ---
 
-## 9. Tell LINE about the webhook
+## 10. Tell LINE about the webhook
 
-In the LINE console (same place as step 2):
+In the LINE console → Messaging API tab:
 
-1. **Webhook URL**: `https://YOUR-VERCEL-URL/api/line/webhook`
-2. **Verify** → should return 200.
-3. Toggle **Use webhook** ON.
+1. **Webhook URL** = `https://YOUR-VERCEL-URL/api/line/webhook`
+2. **Verify** → 200 expected.
+3. **Use webhook** → ON.
 
 ---
 
-## 10. Smoke test from your phone
+## 11. (Optional but recommended) Schedule the proactive cron sweep
 
-Add the Official Account on LINE, then send:
+The bot can push you a daily morning briefing and pre-meeting reminders, but the proactive layer needs a recurring trigger. Set up a QStash schedule that hits `/api/cron/sweep` every 15 minutes:
 
-| Message | Expected |
-|---|---|
-| `hi` | Greeting reply, history saved |
-| `remember that I prefer coffee over tea` | Bot acknowledges; future replies factor it in |
-| `remind me in 2 minutes to drink water` | Confirmation, then ⏰ push 2 min later |
-| `what's the weather in Tokyo right now` | Web-search tool fires |
-| Send a photo of food | Bot describes it |
-| `email me at YOUR_EMAIL saying hello` | Bot returns connect link → after OAuth, draft + YES gate, then sends |
+**Option A — Upstash QStash dashboard:**
+1. <https://console.upstash.com/qstash> → **Schedules** → **Create**.
+2. Destination: `https://YOUR-VERCEL-URL/api/cron/sweep`
+3. Cron: `*/15 * * * *`
+4. Method: POST
+5. Body: `{}`
+6. Save.
 
-If something looks off, tail logs:
+**Option B — curl from your terminal** (fill in your QSTASH_TOKEN — pulled from `vercel env pull .env.local`):
 
 ```bash
-vercel logs https://YOUR-VERCEL-URL --follow
+curl -XPOST https://qstash.upstash.io/v2/schedules/https://YOUR-VERCEL-URL/api/cron/sweep \
+  -H "Authorization: Bearer $QSTASH_TOKEN" \
+  -H "Upstash-Cron: */15 * * * *" \
+  -H "Content-Type: application/json" \
+  -d '{}'
 ```
+
+To test the sweep manually without waiting for the schedule:
+
+```bash
+# Manual trigger — uses your OAUTH_STATE_SECRET as a bearer token (already in env)
+curl -XPOST https://YOUR-VERCEL-URL/api/cron/sweep \
+  -H "Authorization: Bearer $OAUTH_STATE_SECRET"
+```
+
+If you skip this step, the bot still works — you just won't get morning briefings or pre-meeting alerts.
+
+---
+
+## 12. Smoke test from your phone
+
+Add the LINE Official Account, then try:
+
+| | |
+|---|---|
+| `hi` | greeting |
+| `help` | bot lists every capability |
+| `set my timezone to Asia/Bangkok` | persisted |
+| `remember I prefer espresso` | saved |
+| `add a task to ship the cert pdf` | task created |
+| `list my tasks` | shows it |
+| `email mom about the cert` | bot uses contacts_search → drafts → YES → sent |
+| Send any photo + `extract text from this` | OCR reply |
+| Send a voice memo + `transcribe this` | transcript reply |
+| Send a PDF + `summarize this document` | bullet-point summary |
+| Send a PDF + `save this to my drive` | uploaded |
+| `send me a daily briefing at 7am` | enabled — verify with manual cron trigger above |
+| `remind me 15 min before each meeting` | pre-meeting alerts on |
+| `what did i send to bob today` | sent_history |
+
+To watch what's happening: `npx vercel logs YOUR-URL`.
 
 ---
 
@@ -146,13 +186,9 @@ vercel logs https://YOUR-VERCEL-URL --follow
 npm install
 vercel env pull .env.local
 npm run dev
-```
-
-For LINE to reach your local server, expose it with a tunnel:
-
-```bash
+# Public-tunnel for LINE webhook:
 ngrok http 3000
-# update LINE webhook URL to https://<ngrok>.ngrok-free.app/api/line/webhook
+# Set LINE webhook URL to https://<ngrok>/api/line/webhook
 ```
 
-Don't forget to switch the LINE webhook back to your prod URL after.
+Don't forget to flip the LINE webhook URL back to prod when done.

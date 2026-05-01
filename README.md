@@ -31,19 +31,35 @@ Built on Next.js 16 + Vercel AI SDK v6 + Gemini, deployed on Vercel Functions. P
 
 | User says (in LINE) | Bot does |
 |---|---|
-| "hi" | Greets, starts remembering |
-| "remember I prefer espresso over filter" | Saves a durable fact, factors it into future replies |
-| "remind me in 5 minutes to stretch" | Schedules a QStash callback; pushes "⏰ stretch" 5 min later |
-| "what's the weather in Bangkok" | Tavily web search |
-| Sends a photo + "what is this" | Gemini multimodal vision answer |
-| "send mom an email saying I'll be late" | Drafts; shows verbatim; you reply YES; sent from your own Gmail |
-| "schedule lunch with Ana tomorrow at noon" | Drafts a Google Calendar event; YES creates it |
-| "search my drive for the q3 deck" | Drive search → returns metadata + share link |
-| "read me my Q3 deck" (after search) | `drive_read_text` returns plain text content of the doc |
-| Sends a PDF in LINE + "email this to bob@x.com" | Stages the PDF, drafts email with the actual file attached, YES sends |
-| Sends 4 photos + "send all of them to my wife" | All 4 staged, drafted as one email with 4 attachments, YES sends |
-| "use my work google account from now on" | Switches active OAuth account |
-| "list my reminders" | Shows pending reminders with cancel ids |
+| "hi" / "help" / "what can you do" | Greets / lists every capability |
+| `set my timezone to Asia/Bangkok` | Stores. Used in calendar drafts, briefings, reminders |
+| `remember I prefer espresso over filter` | Durable fact. Future replies factor it in |
+| `forget memory #3` / `edit memory #2 to say…` | Memory editor |
+| `add a task to ship the cert` / `list my tasks` / `mark task #3 done` | Persistent open work items (distinct from reminders) |
+| `remind me in 5 min to stretch` | One-shot QStash push |
+| `remind me every weekday at 8am to take vitamins` | Recurring schedule |
+| `email mom the receipt` | Looks up "mom" in your Google Contacts → drafts → YES → sent |
+| `email panupolt + jamyang cc grandmatits` | Multi-recipient single draft |
+| `summarize today's inbox` / `what's in my unread emails` | gmail_summarize_recent |
+| `reply to bob's last email saying I'll be there` | gmail_search → draft_gmail_reply (proper threading) |
+| `send this on Monday at 9 AM` | Scheduled email (QStash-deferred) |
+| `schedule lunch with Ana tomorrow at noon` | Google Calendar draft + create |
+| `what's on my calendar today` | list_upcoming_events |
+| `search my drive for the q3 deck` | Drive search |
+| `read me my Q3 deck` (after search) | Plain-text content (auto-converts Google Docs) |
+| Sends a PDF + `save this to my drive` | Drive upload from staged LINE media |
+| Sends a PDF + `email this to bob@x.com` | Real attachment, not a link |
+| Sends 4 photos + `send all of them to my wife` | 4 attachments in one email |
+| Sends a photo + `extract text` | OCR via Gemini multimodal |
+| Sends a voice memo + `transcribe this` | Audio → text |
+| Sends a PDF + `summarize this document` | Bullet-point summary |
+| `use my work google account from now on` | switch_google_account |
+| `connect another google account` | OAuth flow for a second account |
+| `send me a daily briefing at 7am` | Enables proactive morning push (calendar + tasks + optional inbox) |
+| `remind me 15 min before each meeting` | Pre-meeting alerts via cron sweep |
+| `what did I send to bob today` | sent_history audit lookup |
+| `search my old conversations for X` | search_archived_memory (months back) |
+| `export my data` | JSON dump |
 
 ---
 
@@ -125,20 +141,47 @@ For internals you need when modifying the code, see **[CLAUDE.md](./CLAUDE.md)**
 
 ## Tools the bot has
 
-13 tools, organized by category. The model picks them based on the description text.
+40+ tools across 12 categories. The model picks them based on description text.
 
-### Memory
+### Help / Settings
 | Tool | What it does |
 |---|---|
-| `remember` | Save a durable fact about the user |
-| `list_memories` | Show currently-remembered facts |
+| `show_help` | Concise capabilities dump (also covers /help, "what can you do") |
+| `get_my_settings` | Show user's tz / location / language / briefing prefs |
+| `set_timezone` | IANA tz (e.g. "Asia/Bangkok") |
+| `set_location` | Free-text location label |
+| `set_language` | Pin reply language (or null = auto-match) |
+| `enable_morning_briefing` | Daily push at HH:mm local; opt-in inbox digest |
+| `disable_morning_briefing` | |
+| `enable_pre_meeting_alerts` | Push N min before each calendar event |
 
-### Reminders
+### Memory (short-term + long-term)
 | Tool | What it does |
 |---|---|
-| `set_reminder` | Schedule a future LINE push via QStash |
-| `list_reminders` | Show pending reminders |
-| `cancel_reminder` | Cancel by id |
+| `remember` | Add a durable fact |
+| `list_memories` | Show all stored facts (1-indexed) |
+| `update_memory` | Replace a fact at index N |
+| `forget_memory` | Delete a fact at index N |
+| `clear_all_memories` | Wipe all (destructive) |
+| `search_archived_memory` | Search compressed summaries of conversations beyond the rolling 20-turn window |
+| `list_archived_memory` | List all archived chunks |
+
+### Tasks (persistent open items)
+| Tool | What it does |
+|---|---|
+| `add_task` | New task with optional due date |
+| `list_tasks` | Filter open / done / all |
+| `complete_task` / `reopen_task` | Toggle |
+| `update_task` | Edit title/notes/dueAt |
+| `delete_task` | Hard delete |
+
+### Reminders (one-shot + recurring)
+| Tool | What it does |
+|---|---|
+| `set_reminder` | Future LINE push via QStash (one-shot) |
+| `set_recurring_reminder` | Cron schedule (daily / weekdays / weekends at HH:mm local) |
+| `list_reminders` | All pending |
+| `cancel_reminder` | By id (works for both one-shot and recurring) |
 
 ### Web
 | Tool | What it does |
@@ -153,43 +196,81 @@ For internals you need when modifying the code, see **[CLAUDE.md](./CLAUDE.md)**
 | `switch_google_account` | Set active account by email |
 | `disconnect_google_account` | Wipe one account's tokens |
 
-### Email + Calendar (gated by Google OAuth)
+### Contacts (gated by Google OAuth)
+| Tool | What it does |
+|---|---|
+| `contacts_search` | Resolve "mom"/"bob" → email + phone via Google People API + "Other contacts" fallback |
+
+### Email — outbound (gated by Google OAuth)
 | Tool | What it does |
 |---|---|
 | `draft_email` | Compose; queues for YES; multi-recipient + cc/bcc + Drive attachments + LINE-media attachments |
-| `draft_calendar_event` | Compose; queues for YES |
-| `list_upcoming_events` | Read-only peek at calendar |
+| `schedule_email` | Defer the send to a specific future ISO time |
+| `list_scheduled_emails` | View scheduled queue |
+| `cancel_scheduled_email` | Cancel by id |
 
-### Drive
+### Email — inbox (gated by Google OAuth, gmail.readonly)
+| Tool | What it does |
+|---|---|
+| `gmail_search` | Gmail query syntax (`from:bob is:unread newer_than:7d`) |
+| `gmail_read` | Full plain-text body of one message |
+| `gmail_summarize_recent` | Last N hours, optional unread-only |
+| `draft_gmail_reply` | Reply to an existing thread (proper In-Reply-To + References headers + Gmail threadId) |
+
+### Calendar (gated by Google OAuth)
+| Tool | What it does |
+|---|---|
+| `draft_calendar_event` | Compose; queues for YES; attendees + location |
+| `list_upcoming_events` | Read-only peek (also used by morning briefing) |
+
+### Drive (gated by Google OAuth)
 | Tool | What it does |
 |---|---|
 | `drive_search` | Full-text + name search |
 | `drive_list_recent` | Recently modified files |
 | `drive_get_link` | Share link by file id |
 | `drive_read_text` | Plain text contents (auto-converts Google Docs) |
+| `drive_upload_recent_media` | Save staged LINE files (image/video/audio/file) into Drive (optional folder) |
+
+### Media AI (Gemini multimodal on staged LINE files)
+| Tool | What it does |
+|---|---|
+| `transcribe_audio` | Voice memo → text (verbatim) |
+| `summarize_audio` | Voice memo → 2–4 sentence summary |
+| `ocr_image` | Read all text in a photo (receipts, signs, screenshots, handwriting) |
+| `summarize_image` | Describe scene / objects / action items |
+| `summarize_document` | Bullet summary of a PDF (or other staged document) |
 
 ### Staged media
 | Tool | What it does |
 |---|---|
-| `list_staged_media` | What LINE files the bot has staged for attachment, 1-indexed |
+| `list_staged_media` | What LINE files the bot has staged, 1-indexed |
 | `clear_staged_media` | Discard all staged files |
+
+### History / export
+| Tool | What it does |
+|---|---|
+| `sent_history` | Look up emails / events / reminders the bot already sent on the user's behalf (filter by kind, time window, recipient) |
+| `export_my_data` | JSON dump of everything stored about the user (settings, facts, history, archive, tasks, sent log) |
 
 ---
 
 ## Memory model
 
-Three layers, all keyed by LINE `userId`:
+Five layers, all keyed by LINE `userId`:
 
-1. **Profile** (`user:{userId}:profile`) — `{ displayName, joinedAt }`. Set on first contact via LINE Profile API.
-2. **Rolling history** (`user:{userId}:history`) — last 20 turns (`LPUSH` + `LTRIM`). Fed verbatim to the model every turn.
-3. **Extracted facts** (`user:{userId}:facts`) — JSON blob, capped ~4KB. Every 10th turn, a background `gemini-flash-lite-latest` call summarizes recent history into durable facts ("user is in Bangkok", "prefers Thai morning, English evening", etc). Merged with dedupe.
+1. **Profile** (`user:{userId}:profile`) — `{ displayName, joinedAt }`.
+2. **Settings** (`user:{userId}:settings`) — `{ timezone, location, language, morningBriefingTime, preMeetingMinutes, … }`. Injected into every system prompt.
+3. **Rolling history** (`user:{userId}:history`) — last 20 turns. Fed verbatim every turn.
+4. **Extracted facts** (`user:{userId}:facts`) — durable bullets, capped ~4KB. Every 10th turn, an extractor LLM call updates them. User can also `remember` / `update_memory` / `forget_memory` directly.
+5. **Long-term archive** (`user:{userId}:archive`) — every 10 turns, the same extractor pass also writes a 2–4 sentence chunk summary. Capped at 200 chunks (~years of conversation). Searchable via `search_archived_memory`. Cheap substring match — good enough at personal-bot scale.
 
 The user can also explicitly invoke `remember` to write a fact directly.
 
 System prompt every turn includes:
-- Base personality
-- User's display name
-- Current time (UTC + Bangkok local) — so the model can resolve "in 5 minutes"
+- Base personality + capability list
+- User's display name + stored location + preferred language
+- Current UTC time + user's local time in their stored timezone — so the model can resolve "in 5 minutes" / "tomorrow at 3pm" correctly
 - Connected Google accounts (with active marked)
 - Staged LINE media (with index, type, filename, size)
 - All extracted facts as bullets
@@ -262,6 +343,19 @@ LINE files staged for attachment (1-indexed, oldest first):
 A single `draft_email` can have Drive files **and** staged LINE files **and** an arbitrary multi-recipient `to`/`cc`/`bcc`. They all become real RFC-2822 multipart MIME attachments — recipients see the actual files in their inbox, not links.
 
 ---
+
+## Proactive layer
+
+The bot doesn't only react — it initiates. Powered by a single QStash schedule that POSTs `/api/cron/sweep` every 15 minutes:
+
+- **Daily morning briefing**: per-user enable via `enable_morning_briefing`. At the user's chosen local time, the sweep builds a digest from today's calendar + open tasks + (optional) unread Gmail, lightly polished by Gemini, pushed to LINE.
+- **Pre-meeting alerts**: per-user enable via `enable_pre_meeting_alerts`. The sweep checks each user's calendar for events starting within their lead-window and pushes a heads-up. Idempotent per event (`premeet:{userId}:{eventId}` keys, 6h TTL).
+- **Scheduled emails**: separate QStash one-shot per email. When fired, sends and pushes confirmation to LINE.
+- **Recurring reminders**: separate QStash schedule per reminder. Cron is computed from user's local-time HH:mm via `localTimeToUtcCron`.
+
+User registration: every webhook event calls `registerUser(userId)` so the sweep can enumerate. No global state needed beyond the `users:active` set.
+
+Setup: see SETUP.md step 11. One QStash schedule with cron `*/15 * * * *` pointing at `/api/cron/sweep`. Without it the rest of the bot still works — you just don't get morning briefings or pre-meeting alerts.
 
 ## Confirmation gate
 
