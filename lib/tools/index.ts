@@ -15,6 +15,8 @@ import { buildGmailInboxTools } from "./gmail-inbox";
 import { buildMediaAiTools } from "./media-ai";
 import { buildScheduledEmailTools } from "./scheduled-email";
 import { buildSentHistoryTools } from "./sent-history";
+import { buildFinanceTools } from "./finance";
+import { buildWeatherTools } from "./weather";
 import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 
 /**
@@ -24,6 +26,8 @@ import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 export function toolsForUser(userId: string) {
   return {
     ...buildHelpTools(),
+    ...buildFinanceTools(),
+    ...buildWeatherTools(),
     ...buildSettingsTools(userId),
     ...buildMemoryTools(userId),
     ...buildTaskTools(userId),

@@ -529,15 +529,23 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   messages: ModelMessage[];
   tools: T;
 }) {
+  const tStart = Date.now();
   try {
-    return await withTimeout(
+    const r = await withTimeout(
       generateText({
         model: chatModel(),
         system: opts.system,
         messages: opts.messages,
         tools: opts.tools,
-        stopWhen: stepCountIs(8),
+        stopWhen: stepCountIs(4),
         maxRetries: 0,
+        onStepFinish: (step) => {
+          console.log("[agent] gemini step", {
+            ms: Date.now() - tStart,
+            toolCalls: step.toolCalls.map((c) => c?.toolName),
+            finish: step.finishReason,
+          });
+        },
         providerOptions: {
           google: {
             safetySettings: [
@@ -549,34 +557,46 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
           },
         },
       }),
-      30_000,
+      45_000,
     );
+    console.log("[agent] gemini done", { ms: Date.now() - tStart, steps: r.steps.length });
+    return r;
   } catch (err) {
     const isTimeout = err instanceof AgentTimeoutError;
     const quota = parseQuotaError(err);
-    // Cascade on quota/overload/transient AND on hard timeouts (a stuck Gemini call).
     if (!quota && !isTimeout) throw err;
     const fallback = fallbackChatModel();
     if (!fallback || opts.hasMultimodal) throw err;
     console.warn(
       "[agent] cascading to groq",
       isTimeout ? "(gemini timeout)" : `(gemini quota/overload, retry-after ~${quota?.retryAfterSec}s)`,
+      { totalMs: Date.now() - tStart },
     );
+    const tGroq = Date.now();
     try {
-      return await withTimeout(
+      const r = await withTimeout(
         generateText({
           model: fallback as LanguageModel,
           system: opts.system,
           messages: opts.messages,
           tools: opts.tools,
-          stopWhen: stepCountIs(6),
+          stopWhen: stepCountIs(4),
           maxRetries: 0,
+          onStepFinish: (step) => {
+            console.log("[agent] groq step", {
+              ms: Date.now() - tGroq,
+              toolCalls: step.toolCalls.map((c) => c?.toolName),
+              finish: step.finishReason,
+            });
+          },
         }),
-        30_000,
+        45_000,
       );
+      console.log("[agent] groq done", { ms: Date.now() - tGroq, steps: r.steps.length });
+      return r;
     } catch (groqErr) {
       console.error("[agent] groq fallback also failed", groqErr instanceof Error ? `${groqErr.name}: ${groqErr.message}` : groqErr);
-      throw err; // surface the original error to the user-facing catch
+      throw err;
     }
   }
 }

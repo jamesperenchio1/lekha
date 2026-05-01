@@ -25,7 +25,8 @@ export function buildWebSearchTool() {
         const apiKey = env().TAVILY_API_KEY;
         if (!apiKey) return { ok: false, error: "Web search not configured" };
         const ctrl = new AbortController();
-        const timeout = setTimeout(() => ctrl.abort(), 8000);
+        const timeout = setTimeout(() => ctrl.abort(), 6000);
+        const t0 = Date.now();
         try {
           const r = await fetch("https://api.tavily.com/search", {
             method: "POST",
@@ -33,12 +34,13 @@ export function buildWebSearchTool() {
             body: JSON.stringify({
               api_key: apiKey,
               query,
-              max_results: 5,
+              max_results: 3,
               include_answer: true,
               search_depth: "basic",
             }),
             signal: ctrl.signal,
           });
+          console.log("[web_search] tavily", { query, ms: Date.now() - t0, status: r.status });
           if (!r.ok) return { ok: false, error: `Search failed: ${r.status}` };
           const data = (await r.json()) as TavilyResponse;
           return {
@@ -53,7 +55,8 @@ export function buildWebSearchTool() {
           };
         } catch (err) {
           if ((err as { name?: string })?.name === "AbortError") {
-            return { ok: false, error: "Search timed out after 8s — Tavily was slow or unreachable." };
+            console.warn("[web_search] timeout after 6s", { query });
+            return { ok: false, error: "Search timed out after 6s — Tavily was slow or unreachable." };
           }
           return { ok: false, error: `Search failed: ${err instanceof Error ? err.message : String(err)}` };
         } finally {
