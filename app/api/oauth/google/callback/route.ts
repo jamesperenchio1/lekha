@@ -46,14 +46,19 @@ export async function GET(req: NextRequest) {
     console.warn("[oauth] auto-resume failed", err);
   }
 
-  // Always nudge them back to LINE with confirmation of which account is now active.
-  push(userId, [
-    textMsg(
-      resumed
-        ? `(Connected ${email} — picked up your last request automatically.)`
-        : `✅ Connected ${email}. You can switch accounts anytime by saying "use my other Google account".`,
-    ),
-  ]).catch(() => {});
+  // Always nudge them back to LINE. Awaited so the function doesn't return
+  // before the push has been dispatched (Vercel may freeze the runtime).
+  try {
+    await push(userId, [
+      textMsg(
+        resumed
+          ? `(Connected ${email} — picked up your last request automatically.)`
+          : `✅ Connected ${email}. You can switch accounts anytime by saying "use my other Google account".`,
+      ),
+    ]);
+  } catch (err) {
+    console.warn("[oauth] final push failed", err);
+  }
 
   return htmlPage(
     resumed

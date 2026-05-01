@@ -1,7 +1,10 @@
 import { z } from "zod";
 import { tool } from "ai";
 import { google } from "googleapis";
+import { Readable } from "node:stream";
 import { withGoogleClient } from "./with-google";
+import { listRecentMedia, clearRecentMedia } from "@/lib/memory/recent-media";
+import { getMessageContent } from "@/lib/line/client";
 
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive";
 
@@ -13,6 +16,23 @@ type DriveFileLite = {
   webViewLink: string | null;
   owners: string[];
 };
+
+function defaultDriveName(kind: "image" | "video" | "audio" | "file", mime: string): string {
+  const m = mime.toLowerCase();
+  const ext =
+    m === "image/jpeg" || m === "image/jpg" ? ".jpg"
+    : m === "image/png" ? ".png"
+    : m === "image/gif" ? ".gif"
+    : m === "image/webp" ? ".webp"
+    : m === "video/mp4" ? ".mp4"
+    : m === "video/quicktime" ? ".mov"
+    : m === "audio/m4a" || m === "audio/x-m4a" || m === "audio/mp4" ? ".m4a"
+    : m === "audio/mpeg" || m === "audio/mp3" ? ".mp3"
+    : m === "application/pdf" ? ".pdf"
+    : "";
+  const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
+  return `${kind}-${stamp}${ext}`;
+}
 
 function summarize(file: {
   id?: string | null;
@@ -103,6 +123,69 @@ export function buildDriveTools(userId: string) {
             mimeType: r.data.mimeType,
             link: r.data.webViewLink,
           };
+        });
+      },
+    }),
+
+    drive_upload_recent_media: tool({
+      description:
+        "Upload one or all of the user's staged LINE media (image/video/audio/file) to their Google Drive. Use when the user says 'save this to my Drive'. Optional folderId places it inside a specific Drive folder.",
+      inputSchema: z.object({
+        indexes: z
+          .array(z.number().int().min(1))
+          .max(10)
+          .optional()
+          .describe("1-indexed staged-media positions; omit to upload ALL staged."),
+        filenames: z
+          .array(z.string().max(120))
+          .max(10)
+          .optional()
+          .describe("Optional filename overrides aligned with indexes."),
+        folderId: z.string().optional().describe("Drive folder id to upload into. Omit for root."),
+        fromEmail: z.string().email().optional(),
+      }),
+      execute: async ({ indexes, filenames, folderId, fromEmail }) => {
+        const staged = await listRecentMedia(userId);
+        if (!staged.length) {
+          return { ok: false, error: "No staged LINE media. Send the file(s) first." };
+        }
+        const targets = (indexes ?? staged.map((_, i) => i + 1)).map((i) => {
+          if (i < 1 || i > staged.length) {
+            throw new Error(`Index ${i} out of range (only ${staged.length} staged).`);
+          }
+          return staged[i - 1]!;
+        });
+        return withGoogleClient(userId, fromEmail, [DRIVE_SCOPE], async ({ client }) => {
+          const drive = google.drive({ version: "v3", auth: client });
+          const uploaded: { id: string; name: string; webViewLink: string | null }[] = [];
+          for (let i = 0; i < targets.length; i++) {
+            const item = targets[i]!;
+            const { bytes, contentType } = await getMessageContent(item.messageId);
+            const overrideName = filenames?.[i];
+            const name =
+              (overrideName && overrideName.length > 0 ? overrideName : null) ??
+              item.fileName ??
+              defaultDriveName(item.kind, contentType);
+            const r = await drive.files.create({
+              requestBody: {
+                name,
+                ...(folderId ? { parents: [folderId] } : {}),
+              },
+              media: {
+                mimeType: contentType,
+                body: Readable.from(Buffer.from(bytes)),
+              },
+              fields: "id,name,webViewLink",
+            });
+            uploaded.push({
+              id: r.data.id ?? "",
+              name: r.data.name ?? name,
+              webViewLink: r.data.webViewLink ?? null,
+            });
+          }
+          // Clear staged after a clean upload, mirroring email-send behavior.
+          if (!indexes) await clearRecentMedia(userId);
+          return { ok: true as const, uploaded };
         });
       },
     }),

@@ -3,6 +3,7 @@ import { tool } from "ai";
 import { Client as QStash } from "@upstash/qstash";
 import { redis } from "@/lib/memory/redis";
 import { env, hasQStash } from "@/lib/env";
+import { localTimeToUtcCron } from "@/lib/cron";
 
 const qstash = () => {
   if (!hasQStash()) throw new Error("QStash not configured");
@@ -14,6 +15,8 @@ type StoredReminder = {
   message: string;
   fireAt: number;
   qstashId: string;
+  /** If set, this is a recurring reminder; the QStash id is a schedule, not a one-shot. */
+  cron?: string;
 };
 
 const reminderKey = (userId: string, id: string) => `reminder:${userId}:${id}`;
@@ -67,6 +70,9 @@ export function buildReminderTools(userId: string) {
           };
           await redis().set(reminderKey(userId, id), stored, { ex: delaySec + 60 });
           await redis().sadd(reminderListKey(userId), id);
+          // Roll the set's TTL forward to ~14 months so it can never outlive
+          // the longest possible reminder (1 year max) without housekeeping.
+          await redis().expire(reminderListKey(userId), 60 * 60 * 24 * 400);
           console.log("[reminder] scheduled", { userId, id, fireAt: new Date(fireAt).toISOString(), delaySec });
           return { ok: true, id, fireAt: new Date(fireAt).toISOString() };
         } catch (err) {
@@ -95,19 +101,75 @@ export function buildReminderTools(userId: string) {
     }),
 
     cancel_reminder: tool({
-      description: "Cancel a pending reminder by its id.",
+      description: "Cancel a pending (one-shot or recurring) reminder by its id.",
       inputSchema: z.object({ id: z.string() }),
       execute: async ({ id }) => {
         const r = await redis().get<StoredReminder>(reminderKey(userId, id));
         if (!r) return { ok: false, error: "Reminder not found" };
         try {
-          await qstash().messages.delete(r.qstashId);
+          if (r.cron) {
+            await qstash().schedules.delete(r.qstashId);
+          } else {
+            await qstash().messages.delete(r.qstashId);
+          }
         } catch {
           // already fired or deleted; continue
         }
         await redis().del(reminderKey(userId, id));
         await redis().srem(reminderListKey(userId), id);
         return { ok: true };
+      },
+    }),
+
+    set_recurring_reminder: tool({
+      description:
+        "Schedule a recurring reminder (e.g. 'every weekday at 8am to take vitamins'). Pass the time in 24h HH:mm in the user's local timezone — the system converts to UTC before scheduling.",
+      inputSchema: z.object({
+        time: z.string().regex(/^\d{1,2}:\d{2}$/, "must be HH:mm"),
+        message: z.string().min(1).max(500),
+        timezone: z
+          .string()
+          .describe("IANA timezone like 'Asia/Bangkok'. Use the user's stored setting if known."),
+        days: z
+          .enum(["daily", "weekdays", "weekends"])
+          .default("daily"),
+      }),
+      execute: async ({ time, message, timezone, days }) => {
+        const cronTime = localTimeToUtcCron(time, timezone);
+        if (!cronTime) return { ok: false, error: "Invalid time format" };
+        const dayPart =
+          days === "weekdays" ? "1-5" : days === "weekends" ? "0,6" : "*";
+        // localTimeToUtcCron returns "M H * * *" — splice in the day-of-week.
+        const parts = cronTime.split(" ");
+        const cronUtc = `${parts[0]} ${parts[1]} * * ${dayPart}`;
+
+        const id = crypto.randomUUID();
+        const callbackUrl = `${env().APP_BASE_URL}/api/reminders/fire`;
+        try {
+          const sched = await qstash().schedules.create({
+            destination: callbackUrl,
+            cron: cronUtc,
+            body: JSON.stringify({ userId, id, message, recurring: true }),
+            headers: { "Content-Type": "application/json" },
+          });
+          const stored: StoredReminder = {
+            id,
+            message,
+            fireAt: Date.now(), // not really used for recurring
+            qstashId: sched.scheduleId,
+            cron: cronUtc,
+          };
+          await redis().set(reminderKey(userId, id), stored);
+          await redis().sadd(reminderListKey(userId), id);
+          await redis().expire(reminderListKey(userId), 60 * 60 * 24 * 400);
+          return { ok: true, id, cron: cronUtc, days };
+        } catch (err) {
+          console.error("[reminder] recurring schedule failed", err);
+          return {
+            ok: false,
+            error: err instanceof Error ? err.message : "Failed to schedule recurring reminder",
+          };
+        }
       },
     }),
   };

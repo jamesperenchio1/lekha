@@ -25,7 +25,7 @@ export function buildGoogleAccountTools(userId: string) {
         "Generate a connect link for the user to add a Google account (or add another). The link must be tapped from LINE; OAuth happens in the browser. New accounts become active automatically.",
       inputSchema: z.object({}),
       execute: async () => {
-        const url = buildConnectUrl(userId);
+        const url = await buildConnectUrl(userId);
         return {
           url,
           note: "Link expires in 10 minutes. After connecting, the new account becomes active.",

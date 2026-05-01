@@ -11,7 +11,7 @@ export default async function ConnectPage({
   const { token } = await params;
   let userId: string;
   try {
-    userId = verifyConnectToken(token);
+    userId = await verifyConnectToken(token);
   } catch {
     return (
       <main style={pageStyle}>

@@ -6,6 +6,15 @@ import { buildCalendarTools } from "./calendar";
 import { buildDriveTools } from "./drive";
 import { buildGoogleAccountTools } from "./google-accounts";
 import { buildStagedMediaTools } from "./staged-media";
+import { buildSettingsTools } from "./settings";
+import { buildTaskTools } from "./tasks";
+import { buildContactTools } from "./contacts";
+import { buildHelpTools } from "./help";
+import { buildExportTools } from "./export";
+import { buildGmailInboxTools } from "./gmail-inbox";
+import { buildMediaAiTools } from "./media-ai";
+import { buildScheduledEmailTools } from "./scheduled-email";
+import { buildSentHistoryTools } from "./sent-history";
 import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 
 /**
@@ -14,13 +23,22 @@ import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
  */
 export function toolsForUser(userId: string) {
   return {
+    ...buildHelpTools(),
+    ...buildSettingsTools(userId),
+    ...buildMemoryTools(userId),
+    ...buildTaskTools(userId),
+    ...buildExportTools(userId),
+    ...buildSentHistoryTools(userId),
+    ...buildMediaAiTools(userId),
     ...(hasQStash() ? buildReminderTools(userId) : {}),
     ...(env().TAVILY_API_KEY ? buildWebSearchTool() : {}),
-    ...buildMemoryTools(userId),
     ...(hasGoogleOAuth() ? buildEmailTools(userId) : {}),
     ...(hasGoogleOAuth() ? buildCalendarTools(userId) : {}),
     ...(hasGoogleOAuth() ? buildDriveTools(userId) : {}),
+    ...(hasGoogleOAuth() ? buildGmailInboxTools(userId) : {}),
+    ...(hasGoogleOAuth() ? buildContactTools(userId) : {}),
     ...(hasGoogleOAuth() ? buildGoogleAccountTools(userId) : {}),
+    ...(hasGoogleOAuth() && hasQStash() ? buildScheduledEmailTools(userId) : {}),
     ...buildStagedMediaTools(userId),
   };
 }

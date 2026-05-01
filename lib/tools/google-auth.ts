@@ -9,8 +9,13 @@ export const SCOPES = [
   "email",
   "profile",
   "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/calendar.readonly",
   "https://www.googleapis.com/auth/drive",
+  "https://www.googleapis.com/auth/contacts.readonly",
+  "https://www.googleapis.com/auth/contacts.other.readonly",
 ];
 
 type StoredTokens = {
@@ -34,6 +39,7 @@ const accountsKey = (userId: string) => `google:accounts:${userId}`;
 const tokensKey = (userId: string, email: string) => `google:tokens:${userId}:${email}`;
 const legacyTokensKey = (userId: string) => `google:tokens:${userId}`; // pre-multi-account
 const stateKey = (nonce: string) => `oauth:state:${nonce}`;
+const connectLinkKey = (sigB64u: string) => `oauth:connect_link:${sigB64u}`;
 
 function oauth2Client() {
   const e = env();
@@ -41,17 +47,22 @@ function oauth2Client() {
   return new google.auth.OAuth2(e.GOOGLE_CLIENT_ID, e.GOOGLE_CLIENT_SECRET, e.GOOGLE_REDIRECT_URI);
 }
 
-/** Build a signed connect-link the user can open from LINE. */
-export function buildConnectUrl(userId: string): string {
+/**
+ * Build a signed, server-side single-use connect link.
+ * The HMAC alone isn't enough — anyone who saw the link could replay it within the TTL window.
+ * We additionally write a Redis marker keyed by the signature; verifyConnectToken consumes it atomically.
+ */
+export async function buildConnectUrl(userId: string): Promise<string> {
   const expiresAt = Date.now() + 10 * 60 * 1000;
   const payload = `${userId}.${expiresAt}`;
   const sig = hmac(payload, env().OAUTH_STATE_SECRET);
+  await redis().set(connectLinkKey(sig), { userId, expiresAt }, { ex: 10 * 60 });
   const token = Buffer.from(`${payload}.${sig}`, "utf8").toString("base64url");
   return `${env().APP_BASE_URL}/connect/${token}`;
 }
 
-/** Validate a connect-link token and return the userId. */
-export function verifyConnectToken(token: string): string {
+/** Validate AND consume a connect-link token. Returns the userId; subsequent uses fail. */
+export async function verifyConnectToken(token: string): Promise<string> {
   const decoded = Buffer.from(token, "base64url").toString("utf8");
   const parts = decoded.split(".");
   if (parts.length !== 3) throw new Error("malformed token");
@@ -60,6 +71,9 @@ export function verifyConnectToken(token: string): string {
   if (!safeEqual(sig, expected)) throw new Error("bad signature");
   const expiresAt = Number(expiresAtStr);
   if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) throw new Error("expired");
+  // Atomic single-use consumption.
+  const consumed = await redis().getdel<{ userId: string }>(connectLinkKey(sig));
+  if (!consumed || consumed.userId !== userId) throw new Error("link already used or expired");
   return userId;
 }
 
@@ -83,9 +97,9 @@ export async function completeOAuth(
   code: string,
   state: string,
 ): Promise<{ userId: string; email: string }> {
-  const stored = await redis().get<{ userId: string }>(stateKey(state));
+  // Atomic single-use consumption — prevents replay if two callbacks land concurrently.
+  const stored = await redis().getdel<{ userId: string }>(stateKey(state));
   if (!stored) throw new Error("invalid or expired state");
-  await redis().del(stateKey(state));
   const client = oauth2Client();
   const { tokens } = await client.getToken(code);
   if (!tokens.refresh_token) {

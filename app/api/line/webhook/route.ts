@@ -26,6 +26,9 @@ import { listAccounts } from "@/lib/tools/google-auth";
 import { renderDraftsBlock } from "@/lib/llm/render-drafts";
 import { executePendingAll } from "@/lib/pending-runner";
 import { appendRecentMedia, listRecentMedia } from "@/lib/memory/recent-media";
+import { registerUser } from "@/lib/memory/user-registry";
+import { getSettings } from "@/lib/memory/settings";
+import { logSent } from "@/lib/memory/sent-log";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -85,6 +88,9 @@ async function handleEvent(event: LineEvent): Promise<void> {
   if (!userId) return;
   if (!("replyToken" in event) || !("message" in event)) return;
   const message = event.message;
+
+  // Register so the proactive cron sweep knows about this user.
+  await registerUser(userId).catch(() => {});
 
   // Rate limit (per LINE userId).
   const rl = await checkRateLimit(userId);
@@ -264,6 +270,8 @@ async function respondToOtherMedia(
       },
     );
     const ct = head.headers.get("content-type");
+    // Drain the body to free the underlying socket — fetch() will leak it otherwise.
+    await head.body?.cancel().catch(() => {});
     if (ct) contentType = ct;
   } catch {
     // best effort
@@ -337,13 +345,16 @@ async function runAgent(
   facts: Awaited<ReturnType<typeof loadFacts>>,
   messages: ModelMessage[],
 ): Promise<string> {
-  const accounts = await listAccounts(userId);
+  const [accounts, staged, settings] = await Promise.all([
+    listAccounts(userId),
+    listRecentMedia(userId),
+    getSettings(userId),
+  ]);
   const accountsBlock = accounts.accounts.length
     ? `\n\nConnected Google accounts: ${accounts.accounts
         .map((a) => `${a.email}${a.email === accounts.activeEmail ? " (active)" : ""}`)
         .join(", ")}.`
     : "";
-  const staged = await listRecentMedia(userId);
   const recentBlock = staged.length
     ? `\n\nLINE files staged for attachment (1-indexed, oldest first):\n${staged
         .map((m, i) => {
@@ -360,7 +371,10 @@ async function runAgent(
         })
         .join("\n")}\nUse \`attach_recent_media: true\` to attach all of them, or \`attach_recent_media_indexes: [n,…]\` to pick specific ones.`
     : "";
-  const system = buildSystemPrompt(factsToPromptBlock(facts), profile) + accountsBlock + recentBlock;
+  const system =
+    buildSystemPrompt(factsToPromptBlock(facts), profile, settings) +
+    accountsBlock +
+    recentBlock;
 
   try {
     const result = await generateText({
@@ -439,7 +453,7 @@ async function runAgent(
     // Tools throw typed errors when they need user input. Translate them to chat.
     const inner = unwrap(err);
     if (inner instanceof GoogleAuthRequired) {
-      const url = buildConnectUrl(userId);
+      const url = await buildConnectUrl(userId);
       return `To do that I need access to your Google account. Connect here (link expires in 10 min):\n${url}`;
     }
     if (inner instanceof NeedsConfirmation) {

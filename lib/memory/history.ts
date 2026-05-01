@@ -29,5 +29,9 @@ export async function appendTurn(userId: string, turn: StoredTurn): Promise<numb
 
 /** Total messages we've seen for this user (for fact-extraction cadence). */
 export async function turnCounter(userId: string): Promise<number> {
-  return (await redis().incr(`user:${userId}:turn_counter`)) as number;
+  const k = `user:${userId}:turn_counter`;
+  const n = (await redis().incr(k)) as number;
+  // Rolling 90-day TTL so silent users don't leave dangling keys forever.
+  await redis().expire(k, 60 * 60 * 24 * 90);
+  return n;
 }

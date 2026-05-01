@@ -38,6 +38,37 @@ export async function appendFact(userId: string, fact: string): Promise<void> {
   await saveFacts(userId, facts);
 }
 
+/** Update a single fact at a 1-indexed position. Returns true if it changed. */
+export async function updateFact(userId: string, index1: number, fact: string): Promise<boolean> {
+  const facts = await loadFacts(userId);
+  const i = index1 - 1;
+  if (i < 0 || i >= facts.bullets.length) return false;
+  const norm = fact.trim().slice(0, 200);
+  if (!norm) return false;
+  facts.bullets[i] = norm;
+  facts.updatedAt = Date.now();
+  await saveFacts(userId, facts);
+  return true;
+}
+
+/** Delete a single fact at a 1-indexed position. */
+export async function removeFact(userId: string, index1: number): Promise<boolean> {
+  const facts = await loadFacts(userId);
+  const i = index1 - 1;
+  if (i < 0 || i >= facts.bullets.length) return false;
+  facts.bullets.splice(i, 1);
+  facts.updatedAt = Date.now();
+  await saveFacts(userId, facts);
+  return true;
+}
+
+export async function clearFacts(userId: string): Promise<number> {
+  const facts = await loadFacts(userId);
+  const n = facts.bullets.length;
+  await saveFacts(userId, { bullets: [], updatedAt: Date.now() });
+  return n;
+}
+
 export function factsToPromptBlock(facts: UserFacts): string {
   if (!facts.bullets.length) return "";
   const lines = facts.bullets.map((b) => `- ${b}`).join("\n");

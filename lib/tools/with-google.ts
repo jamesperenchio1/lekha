@@ -49,7 +49,7 @@ export async function withGoogleClient<T>(
       return {
         ok: false,
         need_google_auth: true,
-        connect_url: buildConnectUrl(userId),
+        connect_url: await buildConnectUrl(userId),
         reason: requiredScopes.length
           ? `Need to (re)authorize Google with these scopes: ${requiredScopes.join(", ")}`
           : "Need to authorize Google",
@@ -62,7 +62,7 @@ export async function withGoogleClient<T>(
       return {
         ok: false,
         need_google_auth: true,
-        connect_url: buildConnectUrl(userId),
+        connect_url: await buildConnectUrl(userId),
         reason: "Stored Google token is no longer valid (probably issued by a previous OAuth client) — please reconnect.",
       };
     }

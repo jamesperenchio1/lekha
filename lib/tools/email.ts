@@ -15,48 +15,54 @@ export function buildEmailTools(userId: string) {
     draft_email: tool({
       description:
         "Draft an email from one of the user's connected Gmail accounts. Does NOT send — appends to the pending confirm queue. Pass arrays for to/cc/bcc. Attach Drive files via `attachments`. Attach files the user just sent in LINE (image/video/audio/document) via `attach_recent_media: true` (attaches ALL staged) or `attach_recent_media_indexes: [1,3]` (1-indexed cherry-pick from oldest).",
-      inputSchema: z.object({
-        to: z.array(z.string().email()).min(1).max(50),
-        cc: z.array(z.string().email()).max(50).optional(),
-        bcc: z.array(z.string().email()).max(50).optional(),
-        subject: z.string().min(1).max(200),
-        body: z.string().min(1).max(20_000),
-        fromEmail: z
-          .string()
-          .email()
-          .optional()
-          .describe("Which connected Gmail account to send from. Omit for active."),
-        attachments: z
-          .array(
-            z.object({
-              fileId: z.string().min(1),
-              fromEmail: z.string().email().optional(),
-            }),
-          )
-          .max(10)
-          .optional()
-          .describe("Drive file IDs to attach. Find IDs via drive_search first."),
-        attach_recent_media: z
-          .boolean()
-          .optional()
-          .describe(
-            "Attach ALL files the user has recently sent in LINE (within ~30 min, up to 10). Mutually exclusive with attach_recent_media_indexes.",
-          ),
-        attach_recent_media_indexes: z
-          .array(z.number().int().min(1))
-          .max(10)
-          .optional()
-          .describe(
-            "1-indexed positions of staged LINE files to attach (oldest is 1). Use when the user only wants some of the staged files.",
-          ),
-        attach_recent_media_filenames: z
-          .array(z.string().max(120))
-          .max(10)
-          .optional()
-          .describe(
-            "Optional filename overrides aligned to the SAME order as attach_recent_media_indexes (or to all staged items if attach_recent_media is true). Empty string means keep default.",
-          ),
-      }),
+      inputSchema: z
+        .object({
+          to: z.array(z.string().email()).min(1).max(50),
+          cc: z.array(z.string().email()).max(50).optional(),
+          bcc: z.array(z.string().email()).max(50).optional(),
+          subject: z.string().min(1).max(200),
+          body: z.string().min(1).max(20_000),
+          fromEmail: z
+            .string()
+            .email()
+            .optional()
+            .describe("Which connected Gmail account to send from. Omit for active."),
+          attachments: z
+            .array(
+              z.object({
+                fileId: z.string().min(1),
+                fromEmail: z.string().email().optional(),
+              }),
+            )
+            .max(10)
+            .optional()
+            .describe("Drive file IDs to attach. Find IDs via drive_search first."),
+          attach_recent_media: z
+            .boolean()
+            .optional()
+            .describe(
+              "Attach ALL files the user has recently sent in LINE (within ~30 min, up to 10). Mutually exclusive with attach_recent_media_indexes.",
+            ),
+          attach_recent_media_indexes: z
+            .array(z.number().int().min(1))
+            .max(10)
+            .optional()
+            .describe(
+              "1-indexed positions of staged LINE files to attach (oldest is 1). Use when the user only wants some of the staged files.",
+            ),
+          attach_recent_media_filenames: z
+            .array(z.string().max(120))
+            .max(10)
+            .optional()
+            .describe(
+              "Optional filename overrides aligned to the SAME order as attach_recent_media_indexes (or to all staged items if attach_recent_media is true). Empty string means keep default.",
+            ),
+        })
+        .refine(
+          (d) =>
+            !(d.attach_recent_media === true && d.attach_recent_media_indexes && d.attach_recent_media_indexes.length > 0),
+          { message: "attach_recent_media and attach_recent_media_indexes are mutually exclusive — pick one." },
+        ),
       execute: async ({
         to, cc, bcc, subject, body, fromEmail, attachments,
         attach_recent_media, attach_recent_media_indexes, attach_recent_media_filenames,
@@ -141,16 +147,20 @@ export async function sendEmail(
       staged.forEach((item, idx) => targets.push({ item, idx }));
     }
 
-    for (let i = 0; i < targets.length; i++) {
-      const { item } = targets[i]!;
-      const { bytes, contentType } = await getMessageContent(item.messageId);
-      const overrideName = args.attachRecentMediaFilenames?.[i];
-      const filename =
-        (overrideName && overrideName.length > 0 ? overrideName : null) ??
-        item.fileName ??
-        defaultFilename(item.kind, contentType);
-      fetched.push({ filename, mimeType: contentType, bytes });
-    }
+    // Parallelize the LINE content fetches — large multi-attachment emails would
+    // otherwise serialize and risk Vercel function timeouts.
+    const fetchedMedia = await Promise.all(
+      targets.map(async ({ item }, i) => {
+        const { bytes, contentType } = await getMessageContent(item.messageId);
+        const overrideName = args.attachRecentMediaFilenames?.[i];
+        const filename =
+          (overrideName && overrideName.length > 0 ? overrideName : null) ??
+          item.fileName ??
+          defaultFilename(item.kind, contentType);
+        return { filename, mimeType: contentType, bytes } as FetchedAttachment;
+      }),
+    );
+    fetched.push(...fetchedMedia);
     usedRecentMedia = true;
   }
 
@@ -162,9 +172,14 @@ export async function sendEmail(
     subject: args.subject,
     body: args.body,
     attachments: fetched,
+    inReplyTo: args.inReplyToMessageIdHdr,
+    references: args.references,
   });
 
-  await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+  await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw, ...(args.threadId ? { threadId: args.threadId } : {}) },
+  });
 
   // Once successfully sent with staged media, clear the staged list so the
   // user doesn't accidentally re-attach the same files in the next email.
@@ -240,6 +255,8 @@ function buildRawMime(opts: {
   subject: string;
   body: string;
   attachments: FetchedAttachment[];
+  inReplyTo?: string;
+  references?: string;
 }): string {
   const baseHeaders = [
     `From: ${opts.from}`,
@@ -248,20 +265,35 @@ function buildRawMime(opts: {
     ...(opts.bcc?.length ? [`Bcc: ${opts.bcc.join(", ")}`] : []),
     "MIME-Version: 1.0",
     `Subject: ${encodeHeader(opts.subject)}`,
+    ...(opts.inReplyTo ? [`In-Reply-To: ${opts.inReplyTo}`] : []),
+    ...(opts.references
+      ? [`References: ${opts.references}${opts.inReplyTo ? ` ${opts.inReplyTo}` : ""}`]
+      : opts.inReplyTo
+      ? [`References: ${opts.inReplyTo}`]
+      : []),
   ];
 
+  // For non-ASCII bodies (Thai, emoji, etc.), 7bit is spec-invalid and may be
+  // mangled by some MTAs. Use base64 unconditionally — slightly larger payload,
+  // perfect fidelity.
+  const bodyB64 = chunkBase64(Buffer.from(opts.body, "utf8").toString("base64"));
+
   if (!opts.attachments.length) {
-    const headers = [...baseHeaders, "Content-Type: text/plain; charset=utf-8"].join("\r\n");
-    return Buffer.from(`${headers}\r\n\r\n${opts.body}`, "utf8").toString("base64url");
+    const headers = [
+      ...baseHeaders,
+      "Content-Type: text/plain; charset=utf-8",
+      "Content-Transfer-Encoding: base64",
+    ].join("\r\n");
+    return Buffer.from(`${headers}\r\n\r\n${bodyB64}`, "utf8").toString("base64url");
   }
 
   const boundary = `lekha_${Math.random().toString(36).slice(2)}_${Date.now()}`;
   const parts: string[] = [];
   parts.push(`--${boundary}`);
   parts.push("Content-Type: text/plain; charset=utf-8");
-  parts.push("Content-Transfer-Encoding: 7bit");
+  parts.push("Content-Transfer-Encoding: base64");
   parts.push("");
-  parts.push(opts.body);
+  parts.push(bodyB64);
 
   for (const att of opts.attachments) {
     parts.push(`--${boundary}`);

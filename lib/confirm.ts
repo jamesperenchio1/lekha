@@ -17,6 +17,12 @@ export type SendEmailAction = {
   attachRecentMediaIndexes?: number[];
   /** Filename overrides aligned to the same order as the indexes (or all staged when attachRecentMedia is true). */
   attachRecentMediaFilenames?: string[];
+  /** Reply-to-thread metadata for Gmail threading (when this is a reply). */
+  inReplyToMessageIdHdr?: string;
+  references?: string;
+  threadId?: string;
+  /** Optional QStash schedule id if this email is being sent later (scheduled). */
+  scheduledForTs?: number;
 };
 
 export type CreateCalendarEventAction = {
