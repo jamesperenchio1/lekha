@@ -95,12 +95,9 @@ async function handleEvent(event: LineEvent): Promise<void> {
     const profile = await getOrCreateProfile(userId);
     const name = profile.displayName && profile.displayName !== "friend" ? ` ${profile.displayName}` : "";
     const connectUrl = await buildConnectUrl(userId).catch(() => null);
-    const connectLine = connectUrl
-      ? `\n\n🔗 Connect Google (Gmail, Calendar, Drive):\n${connectUrl}`
-      : "";
     await reply(event.replyToken, [
       textMsg(
-        `Hi${name}! I'm Lekha, your personal assistant 👋\n\nI can set reminders, search the web, look up stocks or weather, read photos, and more. Once you connect Google I can also send email and manage your calendar.\n\nType "help" to see everything I can do.${connectLine}`,
+        `Hi${name}! I'm Lekha, your personal assistant 👋\n\nI can set reminders, search the web, look up stocks or weather, read photos, and more.\n\nType "help" to see everything I can do. To connect Google (Gmail, Calendar, Drive), type "connect google".`,
       ),
     ]);
     return;

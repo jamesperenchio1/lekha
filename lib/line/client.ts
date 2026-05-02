@@ -4,7 +4,7 @@ const API = "https://api.line.me/v2/bot";
 const DATA_API = "https://api-data.line.me/v2/bot";
 
 type TextMessage = { type: "text"; text: string };
-export type LineMessage = TextMessage; // extend later (image, flex, etc.)
+export type LineMessage = TextMessage;
 
 function authHeaders() {
   return {
