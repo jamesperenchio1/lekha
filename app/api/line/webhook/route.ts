@@ -74,10 +74,13 @@ async function handleEvent(event: LineEvent): Promise<void> {
   }
 
   // Allowlist gate — runs for every event type before any other logic.
-  // Admin always passes. Everyone else must be on the allowlist.
-  const adminId = env().ADMIN_LINE_USER_ID;
+  // Admins always pass. Everyone else must be on the allowlist.
+  const adminIds = new Set(
+    (env().ADMIN_LINE_USER_ID ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+  );
+  const isAdmin = (id: string) => adminIds.has(id);
   const eventUserId = event.source?.userId;
-  if (eventUserId && adminId && eventUserId !== adminId) {
+  if (eventUserId && adminIds.size > 0 && !isAdmin(eventUserId)) {
     const allowed = await isAllowed(eventUserId);
     if (!allowed) {
       if ("replyToken" in event && event.replyToken) {
@@ -159,7 +162,7 @@ async function handleEvent(event: LineEvent): Promise<void> {
     }
 
     // Admin-only management commands.
-    if (adminId && userId === adminId) {
+    if (isAdmin(userId)) {
       const addMatch = userText.match(/^\/allow\s+(U\w+)$/i);
       const remMatch = userText.match(/^\/remove\s+(U\w+)$/i);
       if (addMatch) {
