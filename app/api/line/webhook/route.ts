@@ -541,7 +541,11 @@ CRITICAL: when a tool returns { ok: false, error: "..." }, RELAY THE EXACT ERROR
 
     // Override priority: auth → API disabled → other Google error.
     if (authNeeded) {
-      return `I need to (re)authorize your Google account first — the stored token is missing the required scopes.\n\n${authNeeded.connectUrl}\n\n(Link expires in 10 min. After you connect, I'll pick up where we left off automatically.)`;
+      const isReauth = authNeeded.reason.includes("scopes");
+      const intro = isReauth
+        ? "Your Google account needs a quick permission update to access calendar and Gmail features."
+        : "I need access to your Google account to do that.";
+      return `${intro}\n\nType "connect google" to reconnect — it only takes a few seconds and you'll only need to do this once.\n\n${authNeeded.connectUrl}`;
     }
     if (apiDisabled) {
       const enableHint = apiDisabled.enableUrl
