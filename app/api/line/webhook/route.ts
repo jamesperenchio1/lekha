@@ -8,6 +8,7 @@ import {
   showLoading,
   text as textMsg,
   getMessageContent,
+  getProfile,
 } from "@/lib/line/client";
 import { env } from "@/lib/env";
 import { redis } from "@/lib/memory/redis";
@@ -177,8 +178,17 @@ async function handleEvent(event: LineEvent): Promise<void> {
       }
       if (/^\/users$/i.test(userText)) {
         const list = await listAllowed();
-        const body = list.length ? list.join("\n") : "(nobody yet)";
-        await reply(event.replyToken, [textMsg(`Allowed users (${list.length}):\n\n${body}`)]);
+        if (!list.length) {
+          await reply(event.replyToken, [textMsg("Allowed users (0):\n\n(nobody yet)")]);
+          return;
+        }
+        const entries = await Promise.all(
+          list.map(async (id) => {
+            const p = await getProfile(id).catch(() => null);
+            return p?.displayName ? `${p.displayName} (${id})` : id;
+          }),
+        );
+        await reply(event.replyToken, [textMsg(`Allowed users (${list.length}):\n\n${entries.join("\n")}`)]);
         return;
       }
     }
