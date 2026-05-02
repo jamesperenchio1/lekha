@@ -188,6 +188,16 @@ async function handleEvent(event: LineEvent): Promise<void> {
       return;
     }
 
+    // Shortcut: "connect google" generates the OAuth URL without hitting the LLM.
+    if (/^connect\s+google$/i.test(userText)) {
+      const url = await buildConnectUrl(userId).catch(() => null);
+      const msg = url
+        ? `Connect your Google account here (link expires in 10 min):\n${url}`
+        : "Couldn't generate a connect link — make sure GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are set.";
+      await reply(event.replyToken, [textMsg(msg)]);
+      return;
+    }
+
     await respondToText(event.replyToken, userId, profile, userText);
     return;
   }
