@@ -695,7 +695,8 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
         system: opts.system,
         messages: opts.messages,
         tools: opts.tools,
-        stopWhen: stepCountIs(4),
+        temperature: 0.4,
+        stopWhen: stepCountIs(3),
         maxRetries: 0,
         onStepFinish: (step) => {
           if (step.toolCalls.length > 0) geminiRanToolCalls = true;
@@ -721,7 +722,7 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
           },
         },
       }),
-      12_000,
+      20_000,
     );
     console.log("[agent] gemini done", { ms: Date.now() - tStart, steps: r.steps.length });
     return r;
@@ -767,7 +768,8 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
             system: slimSystem,
             messages: opts.messages,
             tools: slimTools,
-            stopWhen: stepCountIs(4),
+            temperature: 0.4,
+            stopWhen: stepCountIs(3),
             maxRetries: 0,
             onStepFinish: (step) => {
               console.log("[agent] groq step", {
