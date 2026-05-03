@@ -681,14 +681,13 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   // If we marked Gemini as down recently (after a 503/quota), skip it entirely
   // and go straight to the Groq fallback path. Avoids burning ~5s per request
   // hitting an upstream that's known to be unhealthy.
-  const skipGemini = !opts.hasMultimodal && (await isGeminiDown());
-  if (skipGemini) {
-    console.log("[agent] skipping gemini (recent overload mark)");
-    throw new Error("gemini-skipped");
-  }
-
   let geminiRanToolCalls = false;
   try {
+    const skipGemini = !opts.hasMultimodal && (await isGeminiDown());
+    if (skipGemini) {
+      console.log("[agent] skipping gemini (recent overload mark)");
+      throw new Error("gemini-skipped");
+    }
     const r = await withTimeout(
       generateText({
         model: chatModel(),
