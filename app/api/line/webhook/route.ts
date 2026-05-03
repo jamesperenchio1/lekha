@@ -487,7 +487,7 @@ You have these tools available right now — use them whenever the user's reques
 - complete_task(id)           — mark a task done.
 - remember(fact)              — save a durable fact about the user.
 - contacts_search(query)      — find an email/phone in the user's Google Contacts.
-- draft_email({to, subject, body, …})       — compose an email (queues for YES confirm).
+- draft_email({to, subject, body, …})       — compose an email (queues for YES confirm). If the user sent a file in LINE (staged below), pass attach_recent_media: true or attach_recent_media_indexes: [n] — do NOT use drive_search for files the user just uploaded in chat.
 - draft_calendar_event({summary, startISO, endISO, attendees?, …}) — compose a calendar event.
 - calendar_today / calendar_week — see today's or this week's events.
 - ocr_image / transcribe_audio — extract text from a recently-sent image / voice memo.
@@ -497,7 +497,7 @@ If none of these tools fit the question, answer briefly from your own knowledge.
 
 CRITICAL: when a tool returns { ok: false, error: "..." }, RELAY THE EXACT ERROR to the user (one short sentence). Never say "I'm having a technical hiccup" or "let me get that sorted" — those are useless evasions. Tell the user what actually broke so they can react.
 
-SOURCE RULE: when presenting live data (prices, rates, weather), always cite the source field from the tool response at the end — e.g. "35.06 THB (Currency API)" or "28°C (wttr.in)".`;
+SOURCE RULE: when presenting live data (prices, rates, weather), always cite the source at the end in this exact format: "35.06 THB (source: Frankfurter)" or "28°C (source: wttr.in)".` + recentBlock;
 
   try {
     const result = await runWithCascade({
