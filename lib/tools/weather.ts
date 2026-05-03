@@ -123,7 +123,7 @@ async function tryOpenMeteo(location: string) {
         condition: wmoDesc(daily?.weather_code?.[i]),
         rainChancePct: daily?.precipitation_probability_max?.[i] ?? null,
       })),
-      source: "Open-Meteo (ECMWF)",
+      source: "Open-Meteo",
     };
   } catch {
     console.warn("[weather] open-meteo failed", { location, ms: Date.now() - t0 });

@@ -209,7 +209,7 @@ export function buildFinanceTools() {
         try {
           // Primary: fawazahmed0 CDN — aggregated market rates, closer to real-time
           let rate: number | null = null;
-          let source = "Currency API (fawazahmed0.com)";
+          let source = "fawazahmed0.com";
           try {
             const data = await fetchJSON<Record<string, Record<string, number>>>(
               `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/${fl}.json`,
@@ -219,7 +219,7 @@ export function buildFinanceTools() {
             // CDN failed — fall back to Frankfurter (ECB daily)
           }
           if (!rate) {
-            source = "Frankfurter (ECB daily)";
+            source = "Frankfurter";
             const data = await fetchJSON<{ rates?: Record<string, number> }>(
               `https://api.frankfurter.app/latest?from=${f}&to=${t2}`,
             );
