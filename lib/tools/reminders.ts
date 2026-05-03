@@ -22,7 +22,7 @@ type StoredReminder = {
 const reminderKey = (userId: string, id: string) => `reminder:${userId}:${id}`;
 const reminderListKey = (userId: string) => `reminder:${userId}:_list`;
 
-async function listReminders(userId: string): Promise<StoredReminder[]> {
+export async function listReminders(userId: string): Promise<StoredReminder[]> {
   const ids = await redis().smembers(reminderListKey(userId));
   if (!ids.length) return [];
   const items = await Promise.all(

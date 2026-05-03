@@ -3,7 +3,17 @@ import { generateText } from "ai";
 import { extractorModel } from "./provider";
 import { getGoogleClient, hasGoogleConnection } from "@/lib/tools/google-auth";
 import { listTasks } from "@/lib/memory/tasks";
+import { listReminders } from "@/lib/tools/reminders";
 import { env } from "@/lib/env";
+
+function formatTimeRemaining(ms: number): string {
+  const totalMin = Math.floor(ms / 60_000);
+  if (totalMin < 1) return "< 1m";
+  if (totalMin < 60) return `${totalMin}m`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
 
 /**
  * Build a daily morning briefing for a single user. Pulls today's calendar,
@@ -15,6 +25,21 @@ export async function buildMorningBriefing(
   opts: { timezone: string; location: string | null; includeInbox: boolean },
 ): Promise<string | null> {
   const sections: string[] = [];
+  const now = Date.now();
+
+  // ⏰ Upcoming reminders (next 24h), with time remaining
+  try {
+    const allReminders = await listReminders(userId);
+    const upcoming = allReminders
+      .filter((r) => !r.cron && r.fireAt > now && r.fireAt < now + 24 * 60 * 60 * 1000)
+      .sort((a, b) => a.fireAt - b.fireAt);
+    if (upcoming.length) {
+      const lines = upcoming.map((r) => `• ${r.message} — in ${formatTimeRemaining(r.fireAt - now)}`);
+      sections.push(`⏰ Reminders today\n${lines.join("\n")}`);
+    }
+  } catch {
+    // reminders not configured or Redis error — skip silently
+  }
 
   // Calendar today
   if (await hasGoogleConnection(userId)) {
@@ -61,15 +86,23 @@ export async function buildMorningBriefing(
     }
   }
 
-  // Open tasks
+  // Open tasks — overdue first, then due within 24h
   const open = await listTasks(userId, "open");
   if (open.length) {
-    const due = open
-      .filter((t) => t.dueAt && t.dueAt < Date.now() + 24 * 60 * 60 * 1000)
+    const overdue = open
+      .filter((t) => t.dueAt && t.dueAt < now)
       .slice(0, 5)
-      .map((t) => `• ${t.title}${t.dueAt ? ` (due ${new Date(t.dueAt).toLocaleString("en-US", { timeZone: opts.timezone })})` : ""}`);
-    if (due.length) sections.push(`📋 Tasks due soon\n${due.join("\n")}`);
-    else if (open.length) sections.push(`📋 ${open.length} open task(s).`);
+      .map((t) => `• [OVERDUE] ${t.title}`);
+    const dueSoon = open
+      .filter((t) => t.dueAt && t.dueAt >= now && t.dueAt < now + 24 * 60 * 60 * 1000)
+      .slice(0, 5)
+      .map((t) => `• ${t.title} (due ${new Date(t.dueAt!).toLocaleTimeString("en-US", { timeZone: opts.timezone, hour: "numeric", minute: "2-digit" })})`);
+    const taskLines = [...overdue, ...dueSoon];
+    if (taskLines.length) {
+      sections.push(`📋 Tasks\n${taskLines.join("\n")}`);
+    } else {
+      sections.push(`📋 ${open.length} open task(s) — none due today.`);
+    }
   }
 
   // Inbox

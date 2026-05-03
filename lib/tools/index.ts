@@ -18,6 +18,8 @@ import { buildSentHistoryTools } from "./sent-history";
 import { buildFinanceTools } from "./finance";
 import { buildWeatherTools } from "./weather";
 import { buildNewsTools } from "./news";
+import { buildListTools } from "./lists";
+import { buildDocsTools } from "./docs";
 import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 
 /**
@@ -46,6 +48,8 @@ export function toolsForUser(userId: string) {
     ...(hasGoogleOAuth() ? buildGoogleAccountTools(userId) : {}),
     ...(hasGoogleOAuth() && hasQStash() ? buildScheduledEmailTools(userId) : {}),
     ...buildStagedMediaTools(userId),
+    ...buildListTools(userId),
+    ...(hasGoogleOAuth() ? buildDocsTools(userId) : {}),
   };
 }
 
@@ -65,6 +69,8 @@ export function coreToolsForUser(userId: string) {
     "contacts_search",
     "draft_email", "draft_calendar_event", "calendar_today", "calendar_week",
     "ocr_image", "transcribe_audio",
+    "add_to_list", "list_items", "show_all_lists", "remove_from_list",
+    "create_google_doc",
   ] as const;
   const out: Record<string, unknown> = {};
   for (const name of keep) {

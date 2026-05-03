@@ -59,7 +59,7 @@ export function buildSettingsTools(userId: string) {
 
     enable_morning_briefing: tool({
       description:
-        "Turn on a daily push briefing at the given local time (HH:mm 24h). Includes weather, today's calendar, open tasks, and (if enabled) inbox highlights.",
+        "Turn on a daily push briefing at the given local time (HH:mm 24h). Includes pending reminders (with time remaining), today's calendar, open tasks (overdue flagged), and (if enabled) inbox highlights.",
       inputSchema: z.object({
         time: z.string().regex(/^\d{1,2}:\d{2}$/),
         include_inbox: z.boolean().default(false),

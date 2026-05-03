@@ -8,6 +8,7 @@ import { hasGoogleConnection, getGoogleClient } from "@/lib/tools/google-auth";
 import { redis } from "@/lib/memory/redis";
 import { push, text as textMsg } from "@/lib/line/client";
 import { buildMorningBriefing, shouldFireBriefingNow } from "@/lib/llm/briefing";
+import { listTasks } from "@/lib/memory/tasks";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -45,7 +46,7 @@ export async function POST(req: NextRequest) {
   }
 
   const users = await listAllUsers();
-  const stats = { briefings: 0, preMeetingPushes: 0, errors: 0, users: users.length };
+  const stats = { briefings: 0, preMeetingPushes: 0, taskWarnings: 0, errors: 0, users: users.length };
 
   await Promise.all(
     users.map(async (userId) => {
@@ -80,6 +81,9 @@ export async function POST(req: NextRequest) {
         ) {
           await sweepPreMeetingPushes(userId, settings.preMeetingLeads, settings.timezone, stats);
         }
+
+        // Task deadline warnings — push once when a task is due within 24h.
+        await sweepTaskDeadlines(userId, settings.timezone, stats);
       } catch (err) {
         stats.errors++;
         console.error("[sweep] user failed", userId, err);
@@ -88,6 +92,36 @@ export async function POST(req: NextRequest) {
   );
 
   return NextResponse.json({ ok: true, stats });
+}
+
+async function sweepTaskDeadlines(
+  userId: string,
+  timezone: string,
+  stats: { taskWarnings: number },
+): Promise<void> {
+  const now = Date.now();
+  const in24h = now + 24 * 60 * 60 * 1000;
+  try {
+    const open = await listTasks(userId, "open");
+    for (const task of open) {
+      if (!task.dueAt || task.dueAt < now || task.dueAt > in24h) continue;
+      // One warning per task per day.
+      const seenKey = `taskwarn:${userId}:${task.id}`;
+      const set = await redis().set(seenKey, 1, { ex: 60 * 60 * 24, nx: true });
+      if (set === null) continue;
+      const local = new Date(task.dueAt).toLocaleTimeString("en-US", {
+        timeZone: timezone,
+        hour: "numeric",
+        minute: "2-digit",
+      });
+      const isToday = task.dueAt < now + 16 * 60 * 60 * 1000; // rough "today"
+      const when = isToday ? `today at ${local}` : "tomorrow";
+      await push(userId, [textMsg(`⏰ Heads up: "${task.title}" is due ${when}.`)]);
+      stats.taskWarnings++;
+    }
+  } catch (err) {
+    console.warn("[sweep] task deadline check failed", userId, err);
+  }
 }
 
 async function sweepPreMeetingPushes(

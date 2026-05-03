@@ -363,13 +363,20 @@ async function respondToOtherMedia(
     ts: Date.now(),
   });
 
+  const isZip =
+    contentType === "application/zip" ||
+    fileName?.toLowerCase().endsWith(".zip") ||
+    fileName?.toLowerCase().endsWith(".gz") ||
+    fileName?.toLowerCase().endsWith(".tar");
   const description = [
     `(User just sent a ${kind} via LINE.`,
     fileName ? ` Filename: "${fileName}".` : "",
     fileSize ? ` Size: ~${(fileSize / 1024).toFixed(0)} KB.` : "",
     durationMs ? ` Duration: ${(durationMs / 1000).toFixed(1)}s.` : "",
     ` Mime: ${contentType}.`,
-    " It's staged for attachment via attach_recent_media on draft_email if they want it sent somewhere.)",
+    isZip
+      ? " NOTE: This is a ZIP/archive file. It is staged for email attachment via attach_recent_media, but you CANNOT open, extract, or read its contents. Tell the user this explicitly.)"
+      : " It's staged for attachment via attach_recent_media on draft_email if they want it sent somewhere.)",
   ].join("");
 
   const history = await loadHistory(userId);
@@ -487,6 +494,11 @@ You have these tools available right now — use them whenever the user's reques
 - complete_task(id)           — mark a task done.
 - remember(fact)              — save a durable fact about the user.
 - contacts_search(query)      — find an email/phone in the user's Google Contacts.
+- add_to_list(list_name, item)     — add item to a named list (grocery list, packing list, etc.).
+- list_items(list_name)            — show all items in a named list.
+- remove_from_list(list_name, item) — remove an item from a named list.
+- show_all_lists()                 — list all named lists + item counts.
+- create_google_doc(title, body)   — create a Google Doc and return the link.
 - draft_email({to, subject, body, …})       — compose an email (queues for YES confirm). If the user sent a file in LINE (staged below), pass attach_recent_media: true or attach_recent_media_indexes: [n] — do NOT use drive_search for files the user just uploaded in chat.
 - draft_calendar_event({summary, startISO, endISO, attendees?, …}) — compose a calendar event.
 - calendar_today / calendar_week — see today's or this week's events.
