@@ -77,6 +77,7 @@ export function buildFinanceTools() {
             exchange: meta.exchangeName ?? null,
             marketState: meta.marketState,
             asOf: meta.regularMarketTime ? new Date(meta.regularMarketTime * 1000).toISOString() : null,
+            source: "Yahoo Finance",
           };
         } catch (err) {
           return {
@@ -139,6 +140,7 @@ export function buildFinanceTools() {
             change,
             changePercent: changePct,
             samples: closes.length,
+            source: "Yahoo Finance",
           };
         } catch (err) {
           return { ok: false, error: `History lookup failed: ${err instanceof Error ? err.message : String(err)}` };
@@ -182,6 +184,7 @@ export function buildFinanceTools() {
             usd: q.usd,
             change24h: q.usd_24h_change ?? null,
             asOf: q.last_updated_at ? new Date(q.last_updated_at * 1000).toISOString() : null,
+            source: "CoinGecko",
           };
         } catch (err) {
           return { ok: false, error: err instanceof Error ? err.message : "Lookup failed" };
@@ -198,22 +201,40 @@ export function buildFinanceTools() {
         amount: z.number().positive().default(1),
       }),
       execute: async ({ from, to, amount }) => {
+        const f = from.toUpperCase();
+        const t2 = to.toUpperCase();
+        const fl = f.toLowerCase();
+        const tl = t2.toLowerCase();
+        const t0 = Date.now();
         try {
-          const t0 = Date.now();
-          // exchangerate.host now requires auth — use frankfurter.app (free, ECB-sourced)
-          const data = await fetchJSON<{ rates?: Record<string, number> }>(
-            `https://api.frankfurter.app/latest?from=${from.toUpperCase()}&to=${to.toUpperCase()}`,
-          );
-          console.log("[fx_rate]", { from, to, ms: Date.now() - t0 });
-          const rate = data.rates?.[to.toUpperCase()];
-          if (!rate) return { ok: false, error: `No rate for ${from}→${to}` };
+          // Primary: fawazahmed0 CDN — aggregated market rates, closer to real-time
+          let rate: number | null = null;
+          let source = "Currency API (fawazahmed0.com)";
+          try {
+            const data = await fetchJSON<Record<string, Record<string, number>>>(
+              `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/${fl}.json`,
+            );
+            rate = data[fl]?.[tl] ?? null;
+          } catch {
+            // CDN failed — fall back to Frankfurter (ECB daily)
+          }
+          if (!rate) {
+            source = "Frankfurter (ECB daily)";
+            const data = await fetchJSON<{ rates?: Record<string, number> }>(
+              `https://api.frankfurter.app/latest?from=${f}&to=${t2}`,
+            );
+            rate = data.rates?.[t2] ?? null;
+          }
+          console.log("[fx_rate]", { from: f, to: t2, rate, ms: Date.now() - t0, source });
+          if (!rate) return { ok: false, error: `No rate available for ${f}→${t2}` };
           return {
             ok: true,
-            from: from.toUpperCase(),
-            to: to.toUpperCase(),
+            from: f,
+            to: t2,
             rate,
             amount,
             converted: rate * amount,
+            source,
           };
         } catch (err) {
           return { ok: false, error: err instanceof Error ? err.message : "Lookup failed" };

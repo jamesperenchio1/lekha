@@ -76,6 +76,7 @@ async function tryWttr(location: string) {
         condition: d.hourly?.[4]?.weatherDesc?.[0]?.value ?? null,
         rainChancePct: d.hourly?.[4]?.chanceofrain ? Number(d.hourly[4]!.chanceofrain) : null,
       })) ?? [],
+      source: "wttr.in",
     };
   } catch {
     console.warn("[weather] wttr.in failed", { location, ms: Date.now() - t0 });
@@ -122,6 +123,7 @@ async function tryOpenMeteo(location: string) {
         condition: wmoDesc(daily?.weather_code?.[i]),
         rainChancePct: daily?.precipitation_probability_max?.[i] ?? null,
       })),
+      source: "Open-Meteo (ECMWF)",
     };
   } catch {
     console.warn("[weather] open-meteo failed", { location, ms: Date.now() - t0 });

@@ -495,7 +495,9 @@ You have these tools available right now — use them whenever the user's reques
 
 If none of these tools fit the question, answer briefly from your own knowledge. Don't make up tool capabilities that aren't listed.
 
-CRITICAL: when a tool returns { ok: false, error: "..." }, RELAY THE EXACT ERROR to the user (one short sentence). Never say "I'm having a technical hiccup" or "let me get that sorted" — those are useless evasions. Tell the user what actually broke so they can react.`;
+CRITICAL: when a tool returns { ok: false, error: "..." }, RELAY THE EXACT ERROR to the user (one short sentence). Never say "I'm having a technical hiccup" or "let me get that sorted" — those are useless evasions. Tell the user what actually broke so they can react.
+
+SOURCE RULE: when presenting live data (prices, rates, weather), always cite the source field from the tool response at the end — e.g. "35.06 THB (Currency API)" or "28°C (wttr.in)".`;
 
   try {
     const result = await runWithCascade({
