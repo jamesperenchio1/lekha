@@ -200,8 +200,9 @@ export function buildFinanceTools() {
       execute: async ({ from, to, amount }) => {
         try {
           const t0 = Date.now();
-          const data = await fetchJSON<{ rates?: Record<string, number>; base?: string }>(
-            `https://api.exchangerate.host/latest?base=${from.toUpperCase()}&symbols=${to.toUpperCase()}`,
+          // exchangerate.host now requires auth — use frankfurter.app (free, ECB-sourced)
+          const data = await fetchJSON<{ rates?: Record<string, number> }>(
+            `https://api.frankfurter.app/latest?from=${from.toUpperCase()}&to=${to.toUpperCase()}`,
           );
           console.log("[fx_rate]", { from, to, ms: Date.now() - t0 });
           const rate = data.rates?.[to.toUpperCase()];
