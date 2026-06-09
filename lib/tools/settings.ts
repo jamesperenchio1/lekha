@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { tool } from "ai";
 import { getSettings, updateSettings } from "@/lib/memory/settings";
+import { buildDashboardToken } from "@/lib/dashboard-auth";
+import { env } from "@/lib/env";
 
 const TZ_REGEX = /^[A-Za-z][A-Za-z_]*\/[A-Za-z][A-Za-z_]*(?:\/[A-Za-z][A-Za-z_]*)?$/;
 
@@ -79,6 +81,17 @@ export function buildSettingsTools(userId: string) {
       execute: async () => {
         await updateSettings(userId, { morningBriefingTime: null });
         return { ok: true };
+      },
+    }),
+
+    open_dashboard: tool({
+      description:
+        "Generate a secure link to the user's settings dashboard where they can toggle language, view timezone, etc. Use when the user asks to open settings, change language, or access the dashboard.",
+      inputSchema: z.object({}),
+      execute: async () => {
+        const token = buildDashboardToken(userId);
+        const url = `${env().APP_BASE_URL}/dashboard/${token}`;
+        return { ok: true, url };
       },
     }),
 
