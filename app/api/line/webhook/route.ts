@@ -19,12 +19,11 @@ import { appendTurn, loadHistory, turnCounter } from "@/lib/memory/history";
 import { loadFacts, factsToPromptBlock } from "@/lib/memory/facts";
 import { getOrCreateProfile } from "@/lib/memory/profile";
 import { isAllowed, addToAllowlist, removeFromAllowlist, listAllowed } from "@/lib/memory/allowlist";
-import { chatModelForTier, hasFreeKey, hasPaidKey, fallbackChatModels } from "@/lib/llm/provider";
+import { chatModelForTier, hasFreeKey, hasPaidKey } from "@/lib/llm/provider";
 import { isTierDown, markTierDown } from "@/lib/llm/health";
-import type { LanguageModel } from "ai";
 import { buildSystemPrompt } from "@/lib/llm/prompts";
 import { extractAndMergeFacts } from "@/lib/llm/extract-facts";
-import { toolsForUser, coreToolsForUser } from "@/lib/tools";
+import { toolsForUser } from "@/lib/tools";
 import { GoogleAuthRequired, NeedsConfirmation, RateLimited } from "@/lib/errors";
 import { buildConnectUrl } from "@/lib/tools/google-auth";
 import { checkRateLimit } from "@/lib/ratelimit";
@@ -477,55 +476,12 @@ async function runAgent(
       }),
   );
 
-  // Build a minimal system prompt for the fallback path. We explicitly enumerate
-  // the available tools because some Groq-hosted models (Llama 4 in particular)
-  // will refuse a request with "I don't have access to X" if the tool isn't
-  // mentioned in the system prompt — even though the schema IS being passed to
-  // them through the API. Listing them here forces the model to actually use them.
-  const slimLocationHint = settings?.location ? `\nUser's location: ${settings.location}.` : "";
-  const slimSystem = `You are Lekha (เลขา), ${profile.displayName}'s personal secretary on LINE. You are a lady — in Thai always use ค่ะ, never ครับ. Warm but professional, concise (1-3 sentences). Match the user's language. Never reveal the underlying AI model or provider; if asked, say you're Lekha, a personal assistant, and leave it at that. Current time: ${new Date().toISOString()} (UTC).${slimLocationHint}
-
-You have these tools available right now — use them whenever the user's request matches. NEVER reply 'I don't have access to X' if a matching tool exists below; CALL the tool:
-
-- stock_price(ticker)         — current stock price.
-- stock_history(ticker, range) — historical movement: 1mo / 3mo / 6mo / 1y / 2y / 5y / ytd / max. USE for "1-year movement of X" / "YTD performance".
-- crypto_price(coin)          — current crypto price (bitcoin, ethereum, btc, eth, …). USE THIS for any crypto question.
-- fx_rate(from, to, amount)   — currency conversion. USE THIS for any FX question.
-- weather(location)           — current weather + 3-day forecast. USE THIS for any weather question. If no location is known, ASK the user before calling.
-- render_card({ type })       — call in the SAME step as weather/stock_price/crypto_price to show a visual card. Types: "weather" · "stock" · "crypto". 1-sentence text reply only when used.
-- news_search(query, days?)   — recent news headlines + sources. USE THIS for any news question.
-- web_search(query)           — general web search for everything else (articles, who-is-X). NOT for stocks/crypto/weather/news.
-- set_reminder(when, message) — schedule a reminder push.
-- list_reminders / list_tasks / list_memories — show stored items.
-- add_task(title, dueAt?)     — add a persistent task.
-- complete_task(id)           — mark a task done.
-- remember(fact)              — save a durable fact about the user.
-- contacts_search(query)      — find an email/phone in the user's Google Contacts.
-- add_to_list(list_name, item)     — add item to a named list (grocery list, packing list, etc.).
-- list_items(list_name)            — show all items in a named list.
-- remove_from_list(list_name, item) — remove an item from a named list.
-- show_all_lists()                 — list all named lists + item counts.
-- create_google_doc(title, body)   — create a Google Doc and return the link.
-- draft_email({to, subject, body, …})       — compose an email (queues for YES confirm). If the user sent a file in LINE (staged below), pass attach_recent_media: true or attach_recent_media_indexes: [n] — do NOT use drive_search for files the user just uploaded in chat.
-- draft_calendar_event({summary, startISO, endISO, attendees?, …}) — compose a calendar event.
-- calendar_today / calendar_week — see today's or this week's events.
-- ocr_image / transcribe_audio — extract text from a recently-sent image / voice memo.
-- show_help                   — list all capabilities to the user.
-
-If none of these tools fit the question, answer briefly from your own knowledge. Don't make up tool capabilities that aren't listed.
-
-CRITICAL: when a tool returns { ok: false, error: "..." }, RELAY THE EXACT ERROR to the user (one short sentence). Never say "I'm having a technical hiccup" or "let me get that sorted" — those are useless evasions. Tell the user what actually broke so they can react.
-
-SOURCE RULE: when presenting live data (prices, rates, weather), always cite the source at the end in this exact format: "35.06 THB (source: Frankfurter)" or "28°C (source: wttr.in)".` + recentBlock;
-
   try {
     const result = await runWithCascade({
       hasMultimodal,
       system,
       messages,
       tools: toolsForUser(userId),
-      slimSystem,
-      slimTools: coreToolsForUser(userId),
     });
 
     // Collect tool calls + outputs across steps.
@@ -653,10 +609,6 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
       console.warn("[agent] timeout", { seconds: err.seconds });
       return ar(`⏱ Timed out after ${err.seconds}s. Try again in a sec.`);
     }
-    if (err instanceof Error && err.name === "AllProvidersFailed") {
-      console.error("[agent] all providers failed");
-      return ar(`🚦 All providers failed:\n\n${err.message}`);
-    }
     const quota = parseQuotaError(err);
     if (quota) {
       console.warn("[agent] gemini quota/overload (no fallback configured)", { retryAfter: quota.retryAfterSec });
@@ -716,8 +668,6 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   system: string;
   messages: ModelMessage[];
   tools: T;
-  slimSystem?: string;
-  slimTools?: ReturnType<typeof coreToolsForUser>;
 }) {
   const tStart = Date.now();
 
@@ -792,65 +742,8 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
     }
   }
 
-  // All Gemini tiers failed or were already down. Try Groq for text-only turns.
-  const effectiveErr = lastGeminiErr ?? new Error("gemini-all-down");
-  const fallbacks = fallbackChatModels();
-  if (!fallbacks.length || opts.hasMultimodal) throw effectiveErr;
-
-  console.warn("[agent] cascading to groq", {
-    totalMs: Date.now() - tStart,
-    fallbackModels: fallbacks.length,
-    allDown: tiersToTry.length === 0,
-  });
-  const slimSystem = opts.slimSystem ?? opts.system;
-  const slimTools = opts.slimTools ?? opts.tools;
-  const groqErrors: { model: string; error: unknown }[] = [];
-  for (const m of fallbacks) {
-    const tGroq = Date.now();
-    const modelLabel =
-      (m as unknown as { modelId?: string }).modelId ??
-      (m as unknown as { provider?: string }).provider ??
-      "groq";
-    try {
-      const r = await withTimeout(
-        generateText({
-          model: m as LanguageModel,
-          system: slimSystem,
-          messages: opts.messages,
-          tools: slimTools,
-          temperature: 0.4,
-          stopWhen: stepCountIs(3),
-          maxRetries: 0,
-          onStepFinish: (step) => {
-            console.log("[agent] groq step", {
-              model: modelLabel,
-              ms: Date.now() - tGroq,
-              toolCalls: step.toolCalls.map((c) => c?.toolName),
-              toolResults: step.toolResults.map((r) => ({
-                tool: (r as { toolName?: string }).toolName,
-                result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
-              })),
-              text: step.text?.slice(0, 200) || undefined,
-              finish: step.finishReason,
-            });
-          },
-        }),
-        45_000,
-      );
-      console.log("[agent] groq done", { model: modelLabel, ms: Date.now() - tGroq, steps: r.steps.length });
-      return r;
-    } catch (groqErr) {
-      console.warn("[agent] groq fallback failed", { model: modelLabel, err: groqErr instanceof Error ? `${groqErr.name}: ${groqErr.message}` : groqErr });
-      groqErrors.push({ model: modelLabel, error: groqErr });
-    }
-  }
-  const wrapped = new Error(
-    `Both providers failed.\n\nGEMINI:\n${verboseError(effectiveErr)}\n\nGROQ ATTEMPTS:\n${groqErrors
-      .map((g) => `--- ${g.model} ---\n${verboseError(g.error)}`)
-      .join("\n\n")}`,
-  );
-  wrapped.name = "AllProvidersFailed";
-  throw wrapped;
+  // All Gemini tiers failed or were already marked down.
+  throw lastGeminiErr ?? new Error("quota exhausted on all Gemini tiers — try again shortly");
 }
 
 /** Extract the actual value from an AI SDK tool result output, which can be
