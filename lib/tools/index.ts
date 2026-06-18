@@ -20,6 +20,7 @@ import { buildWeatherTools } from "./weather";
 import { buildNewsTools } from "./news";
 import { buildListTools } from "./lists";
 import { buildDocsTools } from "./docs";
+import { buildRenderCardTool } from "./render-card";
 import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 
 /**
@@ -29,6 +30,7 @@ import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 export function toolsForUser(userId: string) {
   return {
     ...buildHelpTools(),
+    ...buildRenderCardTool(),
     ...buildFinanceTools(),
     ...buildWeatherTools(),
     ...(env().TAVILY_API_KEY ? buildNewsTools() : {}),
@@ -62,6 +64,7 @@ export function coreToolsForUser(userId: string) {
   const all = toolsForUser(userId);
   const keep = [
     "show_help",
+    "render_card",
     "remember", "list_memories",
     "stock_price", "stock_history", "crypto_price", "fx_rate", "weather", "web_search", "news_search",
     "set_reminder", "list_reminders",

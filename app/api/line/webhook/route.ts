@@ -9,7 +9,10 @@ import {
   text as textMsg,
   getMessageContent,
   getProfile,
+  type LineMessage,
 } from "@/lib/line/client";
+import { buildWeatherFlex, type WeatherResult } from "@/lib/line/weather-flex";
+import { buildStockFlex, buildCryptoFlex, type StockResult, type CryptoResult } from "@/lib/line/finance-flex";
 import { env } from "@/lib/env";
 import { redis } from "@/lib/memory/redis";
 import { appendTurn, loadHistory, turnCounter } from "@/lib/memory/history";
@@ -265,11 +268,11 @@ async function respondToText(
     { role: "user", content: userText },
   ];
 
-  const replyText = await runAgent(userId, profile, facts, messages);
-  await reply(replyToken, [textMsg(replyText)]);
+  const agentResult = await runAgent(userId, profile, facts, messages);
+  await reply(replyToken, [...agentResult.extra, textMsg(agentResult.reply)]);
 
   await appendTurn(userId, { role: "user", content: userText, ts: Date.now() });
-  await appendTurn(userId, { role: "assistant", content: replyText, ts: Date.now() });
+  await appendTurn(userId, { role: "assistant", content: agentResult.reply, ts: Date.now() });
 
   await maybeExtractFacts(userId);
 }
@@ -312,11 +315,11 @@ async function respondToImage(
     },
   ];
 
-  const replyText = await runAgent(userId, profile, facts, messages);
-  await reply(replyToken, [textMsg(replyText)]);
+  const agentResult = await runAgent(userId, profile, facts, messages);
+  await reply(replyToken, [...agentResult.extra, textMsg(agentResult.reply)]);
 
   await appendTurn(userId, { role: "user", content: "[sent an image]", ts: Date.now() });
-  await appendTurn(userId, { role: "assistant", content: replyText, ts: Date.now() });
+  await appendTurn(userId, { role: "assistant", content: agentResult.reply, ts: Date.now() });
   await maybeExtractFacts(userId);
 }
 
@@ -386,15 +389,15 @@ async function respondToOtherMedia(
     { role: "user", content: description },
   ];
 
-  const replyText = await runAgent(userId, profile, facts, messages);
-  await reply(replyToken, [textMsg(replyText)]);
+  const agentResult = await runAgent(userId, profile, facts, messages);
+  await reply(replyToken, [...agentResult.extra, textMsg(agentResult.reply)]);
 
   await appendTurn(userId, {
     role: "user",
     content: `[sent a ${kind}${fileName ? `: ${fileName}` : ""}]`,
     ts: Date.now(),
   });
-  await appendTurn(userId, { role: "assistant", content: replyText, ts: Date.now() });
+  await appendTurn(userId, { role: "assistant", content: agentResult.reply, ts: Date.now() });
   await maybeExtractFacts(userId);
 }
 
@@ -422,12 +425,15 @@ function defaultMimeForKind(kind: "video" | "audio" | "file"): string {
   return "application/octet-stream";
 }
 
+type AgentResult = { reply: string; extra: LineMessage[] };
+function ar(reply: string): AgentResult { return { reply, extra: [] }; }
+
 async function runAgent(
   userId: string,
   profile: { displayName: string },
   facts: Awaited<ReturnType<typeof loadFacts>>,
   messages: ModelMessage[],
-): Promise<string> {
+): Promise<AgentResult> {
   const [accounts, staged, settings] = await Promise.all([
     listAccounts(userId),
     listRecentMedia(userId),
@@ -486,6 +492,7 @@ You have these tools available right now — use them whenever the user's reques
 - crypto_price(coin)          — current crypto price (bitcoin, ethereum, btc, eth, …). USE THIS for any crypto question.
 - fx_rate(from, to, amount)   — currency conversion. USE THIS for any FX question.
 - weather(location)           — current weather + 3-day forecast. USE THIS for any weather question. If no location is known, ASK the user before calling.
+- render_card({ type })       — call in the SAME step as weather/stock_price/crypto_price to show a visual card. Types: "weather" · "stock" · "crypto". 1-sentence text reply only when used.
 - news_search(query, days?)   — recent news headlines + sources. USE THIS for any news question.
 - web_search(query)           — general web search for everything else (articles, who-is-X). NOT for stocks/crypto/weather/news.
 - set_reminder(when, message) — schedule a reminder push.
@@ -526,17 +533,33 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
     let authNeeded: { connectUrl: string; reason: string } | null = null;
     let apiDisabled: { api: string; enableUrl: string | null; message: string } | null = null;
     let googleErr: { status: number | null; message: string } | null = null;
+    // Data captured for render_card — last successful result of each type wins.
+    let weatherResult: WeatherResult | null = null;
+    let stockResult: StockResult | null = null;
+    let cryptoResult: CryptoResult | null = null;
+    const requestedCards = new Set<string>();
     for (const step of result.steps) {
       for (const c of step.toolCalls) {
         if (!c) continue;
         allCalls.push({ toolName: c.toolName, input: c.input });
+        if (c.toolName === "render_card") {
+          const inp = c.input as { type?: string };
+          if (inp?.type) requestedCards.add(inp.type);
+        }
       }
       for (const tr of step.toolResults) {
         if (!tr) continue;
+        const trName = (tr as { toolName?: string }).toolName;
         const value = extractToolValue((tr as { output?: unknown }).output);
         if (!value || typeof value !== "object") continue;
         const v = value as Record<string, unknown>;
-        if (v.need_google_auth && typeof v.connect_url === "string") {
+        if (trName === "weather" && v.ok === true && typeof v.place === "string") {
+          weatherResult = v as unknown as WeatherResult;
+        } else if (trName === "stock_price" && v.ok === true && typeof v.symbol === "string") {
+          stockResult = v as unknown as StockResult;
+        } else if (trName === "crypto_price" && v.ok === true && typeof v.id === "string") {
+          cryptoResult = v as unknown as CryptoResult;
+        } else if (v.need_google_auth && typeof v.connect_url === "string") {
           authNeeded = { connectUrl: v.connect_url, reason: typeof v.reason === "string" ? v.reason : "" };
         } else if (v.google_api_disabled) {
           apiDisabled = {
@@ -559,17 +582,17 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
       const intro = isReauth
         ? "Your Google account needs a quick permission update to access calendar and Gmail features."
         : "I need access to your Google account to do that.";
-      return `${intro}\n\nType "connect google" to reconnect — it only takes a few seconds and you'll only need to do this once.\n\n${authNeeded.connectUrl}`;
+      return ar(`${intro}\n\nType "connect google" to reconnect — it only takes a few seconds and you'll only need to do this once.\n\n${authNeeded.connectUrl}`);
     }
     if (apiDisabled) {
       const enableHint = apiDisabled.enableUrl
         ? `\n\nEnable it here:\n${apiDisabled.enableUrl}`
         : `\n\nEnable it in Google Cloud Console → APIs & Services → Library.`;
-      return `Google says the ${apiDisabled.api} isn't enabled in your Cloud project.${enableHint}\n\nGive it ~1 min to propagate after enabling, then try again.`;
+      return ar(`Google says the ${apiDisabled.api} isn't enabled in your Cloud project.${enableHint}\n\nGive it ~1 min to propagate after enabling, then try again.`);
     }
     if (googleErr) {
       const status = googleErr.status ? ` (HTTP ${googleErr.status})` : "";
-      return `Google API error${status}: ${googleErr.message}`;
+      return ar(`Google API error${status}: ${googleErr.message}`);
     }
 
     // Collect tool errors. If the model soft-apologized instead of relaying the
@@ -582,7 +605,8 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
           const v = value as Record<string, unknown>;
           if (v.ok === false && typeof v.error === "string") {
             const toolName = (tr as { toolName?: string }).toolName ?? "tool";
-            toolErrors.push(`${toolName}: ${v.error}`);
+            // render_card is a signalling tool — its result is never an error to surface.
+            if (toolName !== "render_card") toolErrors.push(`${toolName}: ${v.error}`);
           }
         }
       }
@@ -591,51 +615,55 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
     const draftBlock = renderDraftsBlock(allCalls, accounts.activeEmail);
     const modelText = result.text?.trim() ?? "";
 
-    // If there were tool errors and the model's response doesn't mention the actual
-    // error text (i.e. it soft-apologized), surface the real errors instead.
     if (toolErrors.length > 0 && !draftBlock) {
       const allErrorsPresent = toolErrors.every((e) => modelText.includes(e.split(": ").slice(1).join(": ")));
       if (!allErrorsPresent) {
         console.warn("[agent] model soft-apologized — overriding with real tool errors", toolErrors);
-        return toolErrors.join("\n");
+        return ar(toolErrors.join("\n"));
       }
     }
 
     if (draftBlock) {
       const intro = modelText.length > 0 && modelText.length < 240 ? `${modelText}\n\n` : "";
-      return `${intro}${draftBlock}`;
+      return ar(`${intro}${draftBlock}`);
     }
-    return modelText.length > 0 ? modelText : "(…)";
+
+    // Build flex cards for any render_card calls the model made.
+    const extra: LineMessage[] = [];
+    if (!draftBlock) {
+      if (requestedCards.has("weather") && weatherResult) extra.push(buildWeatherFlex(weatherResult));
+      if (requestedCards.has("stock") && stockResult) extra.push(buildStockFlex(stockResult));
+      if (requestedCards.has("crypto") && cryptoResult) extra.push(buildCryptoFlex(cryptoResult));
+    }
+    return { reply: modelText.length > 0 ? modelText : "(…)", extra };
   } catch (err) {
     // Tools throw typed errors when they need user input. Translate them to chat.
     const inner = unwrap(err);
     if (inner instanceof GoogleAuthRequired) {
       const url = await buildConnectUrl(userId);
-      return `To do that I need access to your Google account. Connect here (link expires in 10 min):\n${url}`;
+      return ar(`To do that I need access to your Google account. Connect here (link expires in 10 min):\n${url}`);
     }
     if (inner instanceof NeedsConfirmation) {
-      return inner.message;
+      return ar(inner.message);
     }
     if (inner instanceof RateLimited) {
-      return `I'm being rate-limited. Try again in ~${inner.retryAfterSec}s.`;
+      return ar(`I'm being rate-limited. Try again in ~${inner.retryAfterSec}s.`);
     }
-    // VERBOSE DEBUG MODE — surface the entire error chain to LINE so we can
-    // diagnose remaining failures in production. Revert when stable.
     if (err instanceof AgentTimeoutError) {
       console.warn("[agent] timeout", { seconds: err.seconds });
-      return `⏱ Timed out after ${err.seconds}s. Both Gemini and Groq took too long. Try again in a sec.`;
+      return ar(`⏱ Timed out after ${err.seconds}s. Both Gemini and Groq took too long. Try again in a sec.`);
     }
     if (err instanceof Error && err.name === "AllProvidersFailed") {
       console.error("[agent] all providers failed");
-      return `🚦 All providers failed:\n\n${err.message}`;
+      return ar(`🚦 All providers failed:\n\n${err.message}`);
     }
     const quota = parseQuotaError(err);
     if (quota) {
       console.warn("[agent] gemini quota/overload (no fallback configured)", { retryAfter: quota.retryAfterSec });
-      return `🚦 Gemini overloaded for ~${quota.retryAfterSec}s.\n\n${verboseError(err)}`;
+      return ar(`🚦 Gemini overloaded for ~${quota.retryAfterSec}s.\n\n${verboseError(err)}`);
     }
     console.error("[agent] unhandled", err);
-    return `🐛 Unhandled agent error:\n\n${verboseError(err)}`;
+    return ar(`🐛 Unhandled agent error:\n\n${verboseError(err)}`);
   }
 }
 
