@@ -9,19 +9,21 @@ import {
   text as textMsg,
   getMessageContent,
   getProfile,
+  type LineMessage,
 } from "@/lib/line/client";
+import { buildWeatherFlex, type WeatherResult } from "@/lib/line/weather-flex";
+import { buildStockFlex, buildCryptoFlex, type StockResult, type CryptoResult } from "@/lib/line/finance-flex";
 import { env } from "@/lib/env";
 import { redis } from "@/lib/memory/redis";
 import { appendTurn, loadHistory, turnCounter } from "@/lib/memory/history";
 import { loadFacts, factsToPromptBlock } from "@/lib/memory/facts";
 import { getOrCreateProfile } from "@/lib/memory/profile";
 import { isAllowed, addToAllowlist, removeFromAllowlist, listAllowed } from "@/lib/memory/allowlist";
-import { chatModel, fallbackChatModels } from "@/lib/llm/provider";
-import { isGeminiDown, markGeminiDown } from "@/lib/llm/health";
-import type { LanguageModel } from "ai";
+import { chatModelForTier, hasFreeKey, hasPaidKey } from "@/lib/llm/provider";
+import { isTierDown, markTierDown } from "@/lib/llm/health";
 import { buildSystemPrompt } from "@/lib/llm/prompts";
 import { extractAndMergeFacts } from "@/lib/llm/extract-facts";
-import { toolsForUser, coreToolsForUser } from "@/lib/tools";
+import { toolsForUser } from "@/lib/tools";
 import { GoogleAuthRequired, NeedsConfirmation, RateLimited } from "@/lib/errors";
 import { buildConnectUrl } from "@/lib/tools/google-auth";
 import { checkRateLimit } from "@/lib/ratelimit";
@@ -265,11 +267,11 @@ async function respondToText(
     { role: "user", content: userText },
   ];
 
-  const replyText = await runAgent(userId, profile, facts, messages);
-  await reply(replyToken, [textMsg(replyText)]);
+  const agentResult = await runAgent(userId, profile, facts, messages);
+  await reply(replyToken, [...agentResult.extra, textMsg(agentResult.reply)]);
 
   await appendTurn(userId, { role: "user", content: userText, ts: Date.now() });
-  await appendTurn(userId, { role: "assistant", content: replyText, ts: Date.now() });
+  await appendTurn(userId, { role: "assistant", content: agentResult.reply, ts: Date.now() });
 
   await maybeExtractFacts(userId);
 }
@@ -312,11 +314,11 @@ async function respondToImage(
     },
   ];
 
-  const replyText = await runAgent(userId, profile, facts, messages);
-  await reply(replyToken, [textMsg(replyText)]);
+  const agentResult = await runAgent(userId, profile, facts, messages);
+  await reply(replyToken, [...agentResult.extra, textMsg(agentResult.reply)]);
 
   await appendTurn(userId, { role: "user", content: "[sent an image]", ts: Date.now() });
-  await appendTurn(userId, { role: "assistant", content: replyText, ts: Date.now() });
+  await appendTurn(userId, { role: "assistant", content: agentResult.reply, ts: Date.now() });
   await maybeExtractFacts(userId);
 }
 
@@ -386,15 +388,15 @@ async function respondToOtherMedia(
     { role: "user", content: description },
   ];
 
-  const replyText = await runAgent(userId, profile, facts, messages);
-  await reply(replyToken, [textMsg(replyText)]);
+  const agentResult = await runAgent(userId, profile, facts, messages);
+  await reply(replyToken, [...agentResult.extra, textMsg(agentResult.reply)]);
 
   await appendTurn(userId, {
     role: "user",
     content: `[sent a ${kind}${fileName ? `: ${fileName}` : ""}]`,
     ts: Date.now(),
   });
-  await appendTurn(userId, { role: "assistant", content: replyText, ts: Date.now() });
+  await appendTurn(userId, { role: "assistant", content: agentResult.reply, ts: Date.now() });
   await maybeExtractFacts(userId);
 }
 
@@ -422,12 +424,15 @@ function defaultMimeForKind(kind: "video" | "audio" | "file"): string {
   return "application/octet-stream";
 }
 
+type AgentResult = { reply: string; extra: LineMessage[] };
+function ar(reply: string): AgentResult { return { reply, extra: [] }; }
+
 async function runAgent(
   userId: string,
   profile: { displayName: string },
   facts: Awaited<ReturnType<typeof loadFacts>>,
   messages: ModelMessage[],
-): Promise<string> {
+): Promise<AgentResult> {
   const [accounts, staged, settings] = await Promise.all([
     listAccounts(userId),
     listRecentMedia(userId),
@@ -471,54 +476,12 @@ async function runAgent(
       }),
   );
 
-  // Build a minimal system prompt for the fallback path. We explicitly enumerate
-  // the available tools because some Groq-hosted models (Llama 4 in particular)
-  // will refuse a request with "I don't have access to X" if the tool isn't
-  // mentioned in the system prompt — even though the schema IS being passed to
-  // them through the API. Listing them here forces the model to actually use them.
-  const slimLocationHint = settings?.location ? `\nUser's location: ${settings.location}.` : "";
-  const slimSystem = `You are Lekha (เลขา), ${profile.displayName}'s personal secretary on LINE. You are a lady — in Thai always use ค่ะ, never ครับ. Warm but professional, concise (1-3 sentences). Match the user's language. Never reveal the underlying AI model or provider; if asked, say you're Lekha, a personal assistant, and leave it at that. Current time: ${new Date().toISOString()} (UTC).${slimLocationHint}
-
-You have these tools available right now — use them whenever the user's request matches. NEVER reply 'I don't have access to X' if a matching tool exists below; CALL the tool:
-
-- stock_price(ticker)         — current stock price.
-- stock_history(ticker, range) — historical movement: 1mo / 3mo / 6mo / 1y / 2y / 5y / ytd / max. USE for "1-year movement of X" / "YTD performance".
-- crypto_price(coin)          — current crypto price (bitcoin, ethereum, btc, eth, …). USE THIS for any crypto question.
-- fx_rate(from, to, amount)   — currency conversion. USE THIS for any FX question.
-- weather(location)           — current weather + 3-day forecast. USE THIS for any weather question. If no location is known, ASK the user before calling.
-- news_search(query, days?)   — recent news headlines + sources. USE THIS for any news question.
-- web_search(query)           — general web search for everything else (articles, who-is-X). NOT for stocks/crypto/weather/news.
-- set_reminder(when, message) — schedule a reminder push.
-- list_reminders / list_tasks / list_memories — show stored items.
-- add_task(title, dueAt?)     — add a persistent task.
-- complete_task(id)           — mark a task done.
-- remember(fact)              — save a durable fact about the user.
-- contacts_search(query)      — find an email/phone in the user's Google Contacts.
-- add_to_list(list_name, item)     — add item to a named list (grocery list, packing list, etc.).
-- list_items(list_name)            — show all items in a named list.
-- remove_from_list(list_name, item) — remove an item from a named list.
-- show_all_lists()                 — list all named lists + item counts.
-- create_google_doc(title, body)   — create a Google Doc and return the link.
-- draft_email({to, subject, body, …})       — compose an email (queues for YES confirm). If the user sent a file in LINE (staged below), pass attach_recent_media: true or attach_recent_media_indexes: [n] — do NOT use drive_search for files the user just uploaded in chat.
-- draft_calendar_event({summary, startISO, endISO, attendees?, …}) — compose a calendar event.
-- calendar_today / calendar_week — see today's or this week's events.
-- ocr_image / transcribe_audio — extract text from a recently-sent image / voice memo.
-- show_help                   — list all capabilities to the user.
-
-If none of these tools fit the question, answer briefly from your own knowledge. Don't make up tool capabilities that aren't listed.
-
-CRITICAL: when a tool returns { ok: false, error: "..." }, RELAY THE EXACT ERROR to the user (one short sentence). Never say "I'm having a technical hiccup" or "let me get that sorted" — those are useless evasions. Tell the user what actually broke so they can react.
-
-SOURCE RULE: when presenting live data (prices, rates, weather), always cite the source at the end in this exact format: "35.06 THB (source: Frankfurter)" or "28°C (source: wttr.in)".` + recentBlock;
-
   try {
     const result = await runWithCascade({
       hasMultimodal,
       system,
       messages,
       tools: toolsForUser(userId),
-      slimSystem,
-      slimTools: coreToolsForUser(userId),
     });
 
     // Collect tool calls + outputs across steps.
@@ -526,17 +489,33 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
     let authNeeded: { connectUrl: string; reason: string } | null = null;
     let apiDisabled: { api: string; enableUrl: string | null; message: string } | null = null;
     let googleErr: { status: number | null; message: string } | null = null;
+    // Data captured for render_card — last successful result of each type wins.
+    let weatherResult: WeatherResult | null = null;
+    let stockResult: StockResult | null = null;
+    let cryptoResult: CryptoResult | null = null;
+    const requestedCards = new Set<string>();
     for (const step of result.steps) {
       for (const c of step.toolCalls) {
         if (!c) continue;
         allCalls.push({ toolName: c.toolName, input: c.input });
+        if (c.toolName === "render_card") {
+          const inp = c.input as { type?: string };
+          if (inp?.type) requestedCards.add(inp.type);
+        }
       }
       for (const tr of step.toolResults) {
         if (!tr) continue;
+        const trName = (tr as { toolName?: string }).toolName;
         const value = extractToolValue((tr as { output?: unknown }).output);
         if (!value || typeof value !== "object") continue;
         const v = value as Record<string, unknown>;
-        if (v.need_google_auth && typeof v.connect_url === "string") {
+        if (trName === "weather" && v.ok === true && typeof v.place === "string") {
+          weatherResult = v as unknown as WeatherResult;
+        } else if (trName === "stock_price" && v.ok === true && typeof v.symbol === "string") {
+          stockResult = v as unknown as StockResult;
+        } else if (trName === "crypto_price" && v.ok === true && typeof v.id === "string") {
+          cryptoResult = v as unknown as CryptoResult;
+        } else if (v.need_google_auth && typeof v.connect_url === "string") {
           authNeeded = { connectUrl: v.connect_url, reason: typeof v.reason === "string" ? v.reason : "" };
         } else if (v.google_api_disabled) {
           apiDisabled = {
@@ -559,17 +538,17 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
       const intro = isReauth
         ? "Your Google account needs a quick permission update to access calendar and Gmail features."
         : "I need access to your Google account to do that.";
-      return `${intro}\n\nType "connect google" to reconnect — it only takes a few seconds and you'll only need to do this once.\n\n${authNeeded.connectUrl}`;
+      return ar(`${intro}\n\nType "connect google" to reconnect — it only takes a few seconds and you'll only need to do this once.\n\n${authNeeded.connectUrl}`);
     }
     if (apiDisabled) {
       const enableHint = apiDisabled.enableUrl
         ? `\n\nEnable it here:\n${apiDisabled.enableUrl}`
         : `\n\nEnable it in Google Cloud Console → APIs & Services → Library.`;
-      return `Google says the ${apiDisabled.api} isn't enabled in your Cloud project.${enableHint}\n\nGive it ~1 min to propagate after enabling, then try again.`;
+      return ar(`Google says the ${apiDisabled.api} isn't enabled in your Cloud project.${enableHint}\n\nGive it ~1 min to propagate after enabling, then try again.`);
     }
     if (googleErr) {
       const status = googleErr.status ? ` (HTTP ${googleErr.status})` : "";
-      return `Google API error${status}: ${googleErr.message}`;
+      return ar(`Google API error${status}: ${googleErr.message}`);
     }
 
     // Collect tool errors. If the model soft-apologized instead of relaying the
@@ -582,7 +561,8 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
           const v = value as Record<string, unknown>;
           if (v.ok === false && typeof v.error === "string") {
             const toolName = (tr as { toolName?: string }).toolName ?? "tool";
-            toolErrors.push(`${toolName}: ${v.error}`);
+            // render_card is a signalling tool — its result is never an error to surface.
+            if (toolName !== "render_card") toolErrors.push(`${toolName}: ${v.error}`);
           }
         }
       }
@@ -591,51 +571,51 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
     const draftBlock = renderDraftsBlock(allCalls, accounts.activeEmail);
     const modelText = result.text?.trim() ?? "";
 
-    // If there were tool errors and the model's response doesn't mention the actual
-    // error text (i.e. it soft-apologized), surface the real errors instead.
     if (toolErrors.length > 0 && !draftBlock) {
       const allErrorsPresent = toolErrors.every((e) => modelText.includes(e.split(": ").slice(1).join(": ")));
       if (!allErrorsPresent) {
         console.warn("[agent] model soft-apologized — overriding with real tool errors", toolErrors);
-        return toolErrors.join("\n");
+        return ar(toolErrors.join("\n"));
       }
     }
 
     if (draftBlock) {
       const intro = modelText.length > 0 && modelText.length < 240 ? `${modelText}\n\n` : "";
-      return `${intro}${draftBlock}`;
+      return ar(`${intro}${draftBlock}`);
     }
-    return modelText.length > 0 ? modelText : "(…)";
+
+    // Build flex cards for any render_card calls the model made.
+    const extra: LineMessage[] = [];
+    if (!draftBlock) {
+      if (requestedCards.has("weather") && weatherResult) extra.push(buildWeatherFlex(weatherResult));
+      if (requestedCards.has("stock") && stockResult) extra.push(buildStockFlex(stockResult));
+      if (requestedCards.has("crypto") && cryptoResult) extra.push(buildCryptoFlex(cryptoResult));
+    }
+    return { reply: modelText.length > 0 ? modelText : "(…)", extra };
   } catch (err) {
     // Tools throw typed errors when they need user input. Translate them to chat.
     const inner = unwrap(err);
     if (inner instanceof GoogleAuthRequired) {
       const url = await buildConnectUrl(userId);
-      return `To do that I need access to your Google account. Connect here (link expires in 10 min):\n${url}`;
+      return ar(`To do that I need access to your Google account. Connect here (link expires in 10 min):\n${url}`);
     }
     if (inner instanceof NeedsConfirmation) {
-      return inner.message;
+      return ar(inner.message);
     }
     if (inner instanceof RateLimited) {
-      return `I'm being rate-limited. Try again in ~${inner.retryAfterSec}s.`;
+      return ar(`I'm being rate-limited. Try again in ~${inner.retryAfterSec}s.`);
     }
-    // VERBOSE DEBUG MODE — surface the entire error chain to LINE so we can
-    // diagnose remaining failures in production. Revert when stable.
     if (err instanceof AgentTimeoutError) {
       console.warn("[agent] timeout", { seconds: err.seconds });
-      return `⏱ Timed out after ${err.seconds}s. Both Gemini and Groq took too long. Try again in a sec.`;
-    }
-    if (err instanceof Error && err.name === "AllProvidersFailed") {
-      console.error("[agent] all providers failed");
-      return `🚦 All providers failed:\n\n${err.message}`;
+      return ar(`⏱ Timed out after ${err.seconds}s. Try again in a sec.`);
     }
     const quota = parseQuotaError(err);
     if (quota) {
       console.warn("[agent] gemini quota/overload (no fallback configured)", { retryAfter: quota.retryAfterSec });
-      return `🚦 Gemini overloaded for ~${quota.retryAfterSec}s.\n\n${verboseError(err)}`;
+      return ar(`🚦 Gemini overloaded for ~${quota.retryAfterSec}s.\n\n${verboseError(err)}`);
     }
     console.error("[agent] unhandled", err);
-    return `🐛 Unhandled agent error:\n\n${verboseError(err)}`;
+    return ar(`🐛 Unhandled agent error:\n\n${verboseError(err)}`);
   }
 }
 
@@ -677,146 +657,93 @@ function verboseError(err: unknown): string {
  * caller surfaces a friendly "out of free quota" message.
  */
 /**
- * Gemini primary (smarter at tool routing), Groq fallback for text-only turns
- * when Gemini hits a rate limit. `maxRetries: 0` disables the SDK's built-in
- * exponential backoff so a quota error cascades to Groq in milliseconds, not
- * after ~10s of silent retries.
+ * Try free Gemini first, fall back to paid Gemini on quota/timeout, then Groq
+ * (if configured) as a last resort for text-only turns. Each tier is skipped if
+ * its key is missing or it has been marked "down" after a recent failure.
+ * `maxRetries: 0` disables the SDK's exponential backoff so failures cascade in
+ * milliseconds rather than after ~10s of silent retries.
  */
 async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   hasMultimodal: boolean;
   system: string;
   messages: ModelMessage[];
   tools: T;
-  /** Optional slim variants used only on the Groq fallback path (saves TPM, helps weaker models). */
-  slimSystem?: string;
-  slimTools?: ReturnType<typeof coreToolsForUser>;
 }) {
   const tStart = Date.now();
-  // If we marked Gemini as down recently (after a 503/quota), skip it entirely
-  // and go straight to the Groq fallback path. Avoids burning ~5s per request
-  // hitting an upstream that's known to be unhealthy.
+
+  // Build ordered tier list: free first (separate GCP project, no billing),
+  // paid as fallback. Skip a tier if its key is absent or recently marked down.
+  const [freeDown, paidDown] = await Promise.all([
+    hasFreeKey() ? isTierDown("free") : Promise.resolve(true),
+    hasPaidKey() ? isTierDown("paid") : Promise.resolve(true),
+  ]);
+  const tiersToTry: ("free" | "paid")[] = [];
+  if (hasFreeKey() && !freeDown) tiersToTry.push("free");
+  if (hasPaidKey() && !paidDown) tiersToTry.push("paid");
+
   let geminiRanToolCalls = false;
-  try {
-    const skipGemini = !opts.hasMultimodal && (await isGeminiDown());
-    if (skipGemini) {
-      console.log("[agent] skipping gemini (recent overload mark)");
-      throw new Error("gemini-skipped");
-    }
-    const r = await withTimeout(
-      generateText({
-        model: chatModel(),
-        system: opts.system,
-        messages: opts.messages,
-        tools: opts.tools,
-        temperature: 0.4,
-        stopWhen: stepCountIs(3),
-        maxRetries: 0,
-        onStepFinish: (step) => {
-          if (step.toolCalls.length > 0) geminiRanToolCalls = true;
-          console.log("[agent] gemini step", {
-            ms: Date.now() - tStart,
-            toolCalls: step.toolCalls.map((c) => c?.toolName),
-            toolResults: step.toolResults.map((r) => ({
-              tool: (r as { toolName?: string }).toolName,
-              result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
-            })),
-            text: step.text?.slice(0, 200) || undefined,
-            finish: step.finishReason,
-          });
-        },
-        providerOptions: {
-          google: {
-            safetySettings: [
-              { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-            ],
+  let lastGeminiErr: unknown = null;
+
+  for (const tier of tiersToTry) {
+    try {
+      const r = await withTimeout(
+        generateText({
+          model: chatModelForTier(tier),
+          system: opts.system,
+          messages: opts.messages,
+          tools: opts.tools,
+          temperature: 0.4,
+          stopWhen: stepCountIs(3),
+          maxRetries: 0,
+          onStepFinish: (step) => {
+            if (step.toolCalls.length > 0) geminiRanToolCalls = true;
+            console.log("[agent] gemini step", {
+              tier,
+              ms: Date.now() - tStart,
+              toolCalls: step.toolCalls.map((c) => c?.toolName),
+              toolResults: step.toolResults.map((r) => ({
+                tool: (r as { toolName?: string }).toolName,
+                result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
+              })),
+              text: step.text?.slice(0, 200) || undefined,
+              finish: step.finishReason,
+            });
           },
-        },
-      }),
-      20_000,
-    );
-    console.log("[agent] gemini done", { ms: Date.now() - tStart, steps: r.steps.length });
-    return r;
-  } catch (err) {
-    const isTimeout = err instanceof AgentTimeoutError;
-    const isSkip = err instanceof Error && err.message === "gemini-skipped";
-    const quota = parseQuotaError(err);
-    if (!quota && !isTimeout && !isSkip) throw err;
-    const fallbacks = fallbackChatModels();
-    if (!fallbacks.length || opts.hasMultimodal) throw err;
-    // If Gemini already executed tool calls before timing out, the side effects
-    // (reminder scheduled, email drafted, etc.) already happened. Cascading to
-    // Groq would re-run those same tools and cause duplicates.
-    if (isTimeout && geminiRanToolCalls) {
-      console.warn("[agent] gemini timed out after tool calls — skipping cascade to avoid duplicates");
-      throw err;
-    }
-    if (!isSkip) {
-      // Mark Gemini down so the next ~60s of requests skip it.
-      await markGeminiDown(60).catch(() => {});
-    }
-    console.warn(
-      "[agent] cascading to groq",
-      isSkip ? "(gemini pre-skipped)" : isTimeout ? "(gemini timeout)" : `(gemini quota/overload, retry-after ~${quota?.retryAfterSec}s)`,
-      { totalMs: Date.now() - tStart, fallbackModels: fallbacks.length },
-    );
-    // On the fallback path, ship a slim system prompt + the core tool subset.
-    // The full registry is ~50 tools (~5K tokens of descriptions) which blows
-    // Groq's tighter TPM limits and confuses weaker models.
-    const slimSystem = opts.slimSystem ?? opts.system;
-    const slimTools = opts.slimTools ?? opts.tools;
-    const groqErrors: { model: string; error: unknown }[] = [];
-    for (const m of fallbacks) {
-      const tGroq = Date.now();
-      const modelLabel =
-        (m as unknown as { modelId?: string }).modelId ??
-        (m as unknown as { provider?: string }).provider ??
-        "groq";
-      try {
-        const r = await withTimeout(
-          generateText({
-            model: m as LanguageModel,
-            system: slimSystem,
-            messages: opts.messages,
-            tools: slimTools,
-            temperature: 0.4,
-            stopWhen: stepCountIs(3),
-            maxRetries: 0,
-            onStepFinish: (step) => {
-              console.log("[agent] groq step", {
-                model: modelLabel,
-                ms: Date.now() - tGroq,
-                toolCalls: step.toolCalls.map((c) => c?.toolName),
-                toolResults: step.toolResults.map((r) => ({
-                  tool: (r as { toolName?: string }).toolName,
-                  result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
-                })),
-                text: step.text?.slice(0, 200) || undefined,
-                finish: step.finishReason,
-              });
+          providerOptions: {
+            google: {
+              safetySettings: [
+                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+              ],
             },
-          }),
-          45_000,
-        );
-        console.log("[agent] groq done", { model: modelLabel, ms: Date.now() - tGroq, steps: r.steps.length });
-        return r;
-      } catch (groqErr) {
-        console.warn("[agent] groq fallback failed", { model: modelLabel, err: groqErr instanceof Error ? `${groqErr.name}: ${groqErr.message}` : groqErr });
-        groqErrors.push({ model: modelLabel, error: groqErr });
+          },
+        }),
+        20_000,
+      );
+      console.log("[agent] gemini done", { tier, ms: Date.now() - tStart, steps: r.steps.length });
+      return r;
+    } catch (err) {
+      const isTimeout = err instanceof AgentTimeoutError;
+      const quota = parseQuotaError(err);
+      if (!quota && !isTimeout) throw err;
+      // If tool calls already executed, cascading would re-run them (duplicate side effects).
+      if (isTimeout && geminiRanToolCalls) {
+        console.warn("[agent] gemini timed out after tool calls — not cascading to avoid duplicates");
+        throw err;
       }
+      await markTierDown(tier, 60).catch(() => {});
+      lastGeminiErr = err;
+      console.warn(`[agent] gemini ${tier} quota/timeout — trying next tier`, {
+        ms: Date.now() - tStart,
+        retryAfter: quota?.retryAfterSec,
+      });
     }
-    // All fallbacks failed — wrap original error with the groq attempts so the
-    // user-facing dump shows what each provider said.
-    const wrapped = new Error(
-      `Both providers failed.\n\nGEMINI:\n${verboseError(err)}\n\nGROQ ATTEMPTS:\n${groqErrors
-        .map((g) => `--- ${g.model} ---\n${verboseError(g.error)}`)
-        .join("\n\n")}`,
-    );
-    wrapped.name = "AllProvidersFailed";
-    throw wrapped;
   }
+
+  // All Gemini tiers failed or were already marked down.
+  throw lastGeminiErr ?? new Error("quota exhausted on all Gemini tiers — try again shortly");
 }
 
 /** Extract the actual value from an AI SDK tool result output, which can be

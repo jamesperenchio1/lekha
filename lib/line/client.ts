@@ -4,7 +4,8 @@ const API = "https://api.line.me/v2/bot";
 const DATA_API = "https://api-data.line.me/v2/bot";
 
 type TextMessage = { type: "text"; text: string };
-export type LineMessage = TextMessage;
+type FlexMessage = { type: "flex"; altText: string; contents: unknown };
+export type LineMessage = TextMessage | FlexMessage;
 
 function authHeaders() {
   return {
@@ -103,6 +104,10 @@ export async function getProfile(userId: string): Promise<{ displayName: string 
 export function text(s: string): TextMessage {
   // LINE caps text messages at 5000 chars.
   return { type: "text", text: s.slice(0, 5000) };
+}
+
+export function flex(altText: string, contents: unknown): FlexMessage {
+  return { type: "flex", altText: altText.slice(0, 400), contents };
 }
 
 async function safeText(r: Response): Promise<string> {

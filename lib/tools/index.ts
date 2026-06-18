@@ -20,6 +20,7 @@ import { buildWeatherTools } from "./weather";
 import { buildNewsTools } from "./news";
 import { buildListTools } from "./lists";
 import { buildDocsTools } from "./docs";
+import { buildRenderCardTool } from "./render-card";
 import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 
 /**
@@ -29,6 +30,7 @@ import { hasGoogleOAuth, hasQStash, env } from "@/lib/env";
 export function toolsForUser(userId: string) {
   return {
     ...buildHelpTools(),
+    ...buildRenderCardTool(),
     ...buildFinanceTools(),
     ...buildWeatherTools(),
     ...(env().TAVILY_API_KEY ? buildNewsTools() : {}),
@@ -53,28 +55,3 @@ export function toolsForUser(userId: string) {
   };
 }
 
-/**
- * Slim registry for fallback path (Groq). Cuts the tool list from ~50 to ~12
- * to stay under tight TPM limits and to be more legible to weaker models.
- * Picks the tools that handle 90% of real requests; specialty tools are dropped.
- */
-export function coreToolsForUser(userId: string) {
-  const all = toolsForUser(userId);
-  const keep = [
-    "show_help",
-    "remember", "list_memories",
-    "stock_price", "stock_history", "crypto_price", "fx_rate", "weather", "web_search", "news_search",
-    "set_reminder", "list_reminders",
-    "add_task", "list_tasks", "complete_task",
-    "contacts_search",
-    "draft_email", "draft_calendar_event", "calendar_today", "calendar_week",
-    "ocr_image", "transcribe_audio",
-    "add_to_list", "list_items", "show_all_lists", "remove_from_list",
-    "create_google_doc",
-  ] as const;
-  const out: Record<string, unknown> = {};
-  for (const name of keep) {
-    if (name in all) out[name] = (all as Record<string, unknown>)[name];
-  }
-  return out as Pick<ReturnType<typeof toolsForUser>, (typeof keep)[number]>;
-}
