@@ -684,7 +684,8 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   let geminiRanToolCalls = false;
   let lastGeminiErr: unknown = null;
 
-  for (const tier of tiersToTry) {
+  for (let i = 0; i < tiersToTry.length; i++) {
+    const tier = tiersToTry[i]!;
     try {
       const r = await withTimeout(
         generateText({
@@ -735,9 +736,9 @@ async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
       }
       await markTierDown(tier, 60).catch(() => {});
       lastGeminiErr = err;
-      console.warn(`[agent] gemini ${tier} quota/timeout — trying next tier`, {
+      const nextTier = tiersToTry[i + 1];
+      console.warn(`[tier] ${tier}→${nextTier ?? "none"} (${isTimeout ? "timeout" : `quota ~${quota?.retryAfterSec ?? 30}s`})`, {
         ms: Date.now() - tStart,
-        retryAfter: quota?.retryAfterSec,
       });
     }
   }
