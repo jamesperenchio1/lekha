@@ -8,6 +8,10 @@ const Env = z.object({
   // LLM (one of)
   AI_GATEWAY_API_KEY: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
+  // Free-tier Gemini key (from a GCP project with no billing account attached).
+  // Set GEMINI_TIER=free to activate it; omit or set GEMINI_TIER=paid to use GEMINI_API_KEY.
+  GEMINI_API_KEY_FREE: z.string().optional(),
+  GEMINI_TIER: z.enum(["free", "paid"]).optional(),
 
   // Google OAuth
   GOOGLE_CLIENT_ID: z.string().optional(),
