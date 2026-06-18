@@ -19,8 +19,8 @@ import { appendTurn, loadHistory, turnCounter } from "@/lib/memory/history";
 import { loadFacts, factsToPromptBlock } from "@/lib/memory/facts";
 import { getOrCreateProfile } from "@/lib/memory/profile";
 import { isAllowed, addToAllowlist, removeFromAllowlist, listAllowed } from "@/lib/memory/allowlist";
-import { chatModel, fallbackChatModels } from "@/lib/llm/provider";
-import { isGeminiDown, markGeminiDown } from "@/lib/llm/health";
+import { chatModelForTier, hasFreeKey, hasPaidKey, fallbackChatModels } from "@/lib/llm/provider";
+import { isTierDown, markTierDown } from "@/lib/llm/health";
 import type { LanguageModel } from "ai";
 import { buildSystemPrompt } from "@/lib/llm/prompts";
 import { extractAndMergeFacts } from "@/lib/llm/extract-facts";
@@ -651,7 +651,7 @@ SOURCE RULE: when presenting live data (prices, rates, weather), always cite the
     }
     if (err instanceof AgentTimeoutError) {
       console.warn("[agent] timeout", { seconds: err.seconds });
-      return ar(`⏱ Timed out after ${err.seconds}s. Both Gemini and Groq took too long. Try again in a sec.`);
+      return ar(`⏱ Timed out after ${err.seconds}s. Try again in a sec.`);
     }
     if (err instanceof Error && err.name === "AllProvidersFailed") {
       console.error("[agent] all providers failed");
@@ -705,146 +705,152 @@ function verboseError(err: unknown): string {
  * caller surfaces a friendly "out of free quota" message.
  */
 /**
- * Gemini primary (smarter at tool routing), Groq fallback for text-only turns
- * when Gemini hits a rate limit. `maxRetries: 0` disables the SDK's built-in
- * exponential backoff so a quota error cascades to Groq in milliseconds, not
- * after ~10s of silent retries.
+ * Try free Gemini first, fall back to paid Gemini on quota/timeout, then Groq
+ * (if configured) as a last resort for text-only turns. Each tier is skipped if
+ * its key is missing or it has been marked "down" after a recent failure.
+ * `maxRetries: 0` disables the SDK's exponential backoff so failures cascade in
+ * milliseconds rather than after ~10s of silent retries.
  */
 async function runWithCascade<T extends ReturnType<typeof toolsForUser>>(opts: {
   hasMultimodal: boolean;
   system: string;
   messages: ModelMessage[];
   tools: T;
-  /** Optional slim variants used only on the Groq fallback path (saves TPM, helps weaker models). */
   slimSystem?: string;
   slimTools?: ReturnType<typeof coreToolsForUser>;
 }) {
   const tStart = Date.now();
-  // If we marked Gemini as down recently (after a 503/quota), skip it entirely
-  // and go straight to the Groq fallback path. Avoids burning ~5s per request
-  // hitting an upstream that's known to be unhealthy.
+
+  // Build ordered tier list: free first (separate GCP project, no billing),
+  // paid as fallback. Skip a tier if its key is absent or recently marked down.
+  const [freeDown, paidDown] = await Promise.all([
+    hasFreeKey() ? isTierDown("free") : Promise.resolve(true),
+    hasPaidKey() ? isTierDown("paid") : Promise.resolve(true),
+  ]);
+  const tiersToTry: ("free" | "paid")[] = [];
+  if (hasFreeKey() && !freeDown) tiersToTry.push("free");
+  if (hasPaidKey() && !paidDown) tiersToTry.push("paid");
+
   let geminiRanToolCalls = false;
-  try {
-    const skipGemini = !opts.hasMultimodal && (await isGeminiDown());
-    if (skipGemini) {
-      console.log("[agent] skipping gemini (recent overload mark)");
-      throw new Error("gemini-skipped");
-    }
-    const r = await withTimeout(
-      generateText({
-        model: chatModel(),
-        system: opts.system,
-        messages: opts.messages,
-        tools: opts.tools,
-        temperature: 0.4,
-        stopWhen: stepCountIs(3),
-        maxRetries: 0,
-        onStepFinish: (step) => {
-          if (step.toolCalls.length > 0) geminiRanToolCalls = true;
-          console.log("[agent] gemini step", {
-            ms: Date.now() - tStart,
-            toolCalls: step.toolCalls.map((c) => c?.toolName),
-            toolResults: step.toolResults.map((r) => ({
-              tool: (r as { toolName?: string }).toolName,
-              result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
-            })),
-            text: step.text?.slice(0, 200) || undefined,
-            finish: step.finishReason,
-          });
-        },
-        providerOptions: {
-          google: {
-            safetySettings: [
-              { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-            ],
+  let lastGeminiErr: unknown = null;
+
+  for (const tier of tiersToTry) {
+    try {
+      const r = await withTimeout(
+        generateText({
+          model: chatModelForTier(tier),
+          system: opts.system,
+          messages: opts.messages,
+          tools: opts.tools,
+          temperature: 0.4,
+          stopWhen: stepCountIs(3),
+          maxRetries: 0,
+          onStepFinish: (step) => {
+            if (step.toolCalls.length > 0) geminiRanToolCalls = true;
+            console.log("[agent] gemini step", {
+              tier,
+              ms: Date.now() - tStart,
+              toolCalls: step.toolCalls.map((c) => c?.toolName),
+              toolResults: step.toolResults.map((r) => ({
+                tool: (r as { toolName?: string }).toolName,
+                result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
+              })),
+              text: step.text?.slice(0, 200) || undefined,
+              finish: step.finishReason,
+            });
           },
-        },
-      }),
-      20_000,
-    );
-    console.log("[agent] gemini done", { ms: Date.now() - tStart, steps: r.steps.length });
-    return r;
-  } catch (err) {
-    const isTimeout = err instanceof AgentTimeoutError;
-    const isSkip = err instanceof Error && err.message === "gemini-skipped";
-    const quota = parseQuotaError(err);
-    if (!quota && !isTimeout && !isSkip) throw err;
-    const fallbacks = fallbackChatModels();
-    if (!fallbacks.length || opts.hasMultimodal) throw err;
-    // If Gemini already executed tool calls before timing out, the side effects
-    // (reminder scheduled, email drafted, etc.) already happened. Cascading to
-    // Groq would re-run those same tools and cause duplicates.
-    if (isTimeout && geminiRanToolCalls) {
-      console.warn("[agent] gemini timed out after tool calls — skipping cascade to avoid duplicates");
-      throw err;
-    }
-    if (!isSkip) {
-      // Mark Gemini down so the next ~60s of requests skip it.
-      await markGeminiDown(60).catch(() => {});
-    }
-    console.warn(
-      "[agent] cascading to groq",
-      isSkip ? "(gemini pre-skipped)" : isTimeout ? "(gemini timeout)" : `(gemini quota/overload, retry-after ~${quota?.retryAfterSec}s)`,
-      { totalMs: Date.now() - tStart, fallbackModels: fallbacks.length },
-    );
-    // On the fallback path, ship a slim system prompt + the core tool subset.
-    // The full registry is ~50 tools (~5K tokens of descriptions) which blows
-    // Groq's tighter TPM limits and confuses weaker models.
-    const slimSystem = opts.slimSystem ?? opts.system;
-    const slimTools = opts.slimTools ?? opts.tools;
-    const groqErrors: { model: string; error: unknown }[] = [];
-    for (const m of fallbacks) {
-      const tGroq = Date.now();
-      const modelLabel =
-        (m as unknown as { modelId?: string }).modelId ??
-        (m as unknown as { provider?: string }).provider ??
-        "groq";
-      try {
-        const r = await withTimeout(
-          generateText({
-            model: m as LanguageModel,
-            system: slimSystem,
-            messages: opts.messages,
-            tools: slimTools,
-            temperature: 0.4,
-            stopWhen: stepCountIs(3),
-            maxRetries: 0,
-            onStepFinish: (step) => {
-              console.log("[agent] groq step", {
-                model: modelLabel,
-                ms: Date.now() - tGroq,
-                toolCalls: step.toolCalls.map((c) => c?.toolName),
-                toolResults: step.toolResults.map((r) => ({
-                  tool: (r as { toolName?: string }).toolName,
-                  result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
-                })),
-                text: step.text?.slice(0, 200) || undefined,
-                finish: step.finishReason,
-              });
+          providerOptions: {
+            google: {
+              safetySettings: [
+                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+              ],
             },
-          }),
-          45_000,
-        );
-        console.log("[agent] groq done", { model: modelLabel, ms: Date.now() - tGroq, steps: r.steps.length });
-        return r;
-      } catch (groqErr) {
-        console.warn("[agent] groq fallback failed", { model: modelLabel, err: groqErr instanceof Error ? `${groqErr.name}: ${groqErr.message}` : groqErr });
-        groqErrors.push({ model: modelLabel, error: groqErr });
+          },
+        }),
+        20_000,
+      );
+      console.log("[agent] gemini done", { tier, ms: Date.now() - tStart, steps: r.steps.length });
+      return r;
+    } catch (err) {
+      const isTimeout = err instanceof AgentTimeoutError;
+      const quota = parseQuotaError(err);
+      if (!quota && !isTimeout) throw err;
+      // If tool calls already executed, cascading would re-run them (duplicate side effects).
+      if (isTimeout && geminiRanToolCalls) {
+        console.warn("[agent] gemini timed out after tool calls — not cascading to avoid duplicates");
+        throw err;
       }
+      await markTierDown(tier, 60).catch(() => {});
+      lastGeminiErr = err;
+      console.warn(`[agent] gemini ${tier} quota/timeout — trying next tier`, {
+        ms: Date.now() - tStart,
+        retryAfter: quota?.retryAfterSec,
+      });
     }
-    // All fallbacks failed — wrap original error with the groq attempts so the
-    // user-facing dump shows what each provider said.
-    const wrapped = new Error(
-      `Both providers failed.\n\nGEMINI:\n${verboseError(err)}\n\nGROQ ATTEMPTS:\n${groqErrors
-        .map((g) => `--- ${g.model} ---\n${verboseError(g.error)}`)
-        .join("\n\n")}`,
-    );
-    wrapped.name = "AllProvidersFailed";
-    throw wrapped;
   }
+
+  // All Gemini tiers failed or were already down. Try Groq for text-only turns.
+  const effectiveErr = lastGeminiErr ?? new Error("gemini-all-down");
+  const fallbacks = fallbackChatModels();
+  if (!fallbacks.length || opts.hasMultimodal) throw effectiveErr;
+
+  console.warn("[agent] cascading to groq", {
+    totalMs: Date.now() - tStart,
+    fallbackModels: fallbacks.length,
+    allDown: tiersToTry.length === 0,
+  });
+  const slimSystem = opts.slimSystem ?? opts.system;
+  const slimTools = opts.slimTools ?? opts.tools;
+  const groqErrors: { model: string; error: unknown }[] = [];
+  for (const m of fallbacks) {
+    const tGroq = Date.now();
+    const modelLabel =
+      (m as unknown as { modelId?: string }).modelId ??
+      (m as unknown as { provider?: string }).provider ??
+      "groq";
+    try {
+      const r = await withTimeout(
+        generateText({
+          model: m as LanguageModel,
+          system: slimSystem,
+          messages: opts.messages,
+          tools: slimTools,
+          temperature: 0.4,
+          stopWhen: stepCountIs(3),
+          maxRetries: 0,
+          onStepFinish: (step) => {
+            console.log("[agent] groq step", {
+              model: modelLabel,
+              ms: Date.now() - tGroq,
+              toolCalls: step.toolCalls.map((c) => c?.toolName),
+              toolResults: step.toolResults.map((r) => ({
+                tool: (r as { toolName?: string }).toolName,
+                result: JSON.stringify((r as { output?: unknown }).output ?? r).slice(0, 300),
+              })),
+              text: step.text?.slice(0, 200) || undefined,
+              finish: step.finishReason,
+            });
+          },
+        }),
+        45_000,
+      );
+      console.log("[agent] groq done", { model: modelLabel, ms: Date.now() - tGroq, steps: r.steps.length });
+      return r;
+    } catch (groqErr) {
+      console.warn("[agent] groq fallback failed", { model: modelLabel, err: groqErr instanceof Error ? `${groqErr.name}: ${groqErr.message}` : groqErr });
+      groqErrors.push({ model: modelLabel, error: groqErr });
+    }
+  }
+  const wrapped = new Error(
+    `Both providers failed.\n\nGEMINI:\n${verboseError(effectiveErr)}\n\nGROQ ATTEMPTS:\n${groqErrors
+      .map((g) => `--- ${g.model} ---\n${verboseError(g.error)}`)
+      .join("\n\n")}`,
+  );
+  wrapped.name = "AllProvidersFailed";
+  throw wrapped;
 }
 
 /** Extract the actual value from an AI SDK tool result output, which can be

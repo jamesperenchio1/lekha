@@ -2,18 +2,22 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createGroq } from "@ai-sdk/groq";
 import { env } from "@/lib/env";
 
-function googleClient() {
+export function hasFreeKey(): boolean {
+  return Boolean(env().GEMINI_API_KEY_FREE);
+}
+
+export function hasPaidKey(): boolean {
   const e = env();
-  const useFree = e.GEMINI_TIER === "free" && e.GEMINI_API_KEY_FREE;
-  const apiKey = useFree
-    ? e.GEMINI_API_KEY_FREE!
+  return Boolean(e.GEMINI_API_KEY ?? e.AI_GATEWAY_API_KEY);
+}
+
+export function chatModelForTier(tier: "free" | "paid") {
+  const e = env();
+  const apiKey = tier === "free"
+    ? e.GEMINI_API_KEY_FREE
     : (e.GEMINI_API_KEY ?? e.AI_GATEWAY_API_KEY);
-  if (!apiKey) {
-    throw new Error(
-      "Missing API key. Set GEMINI_API_KEY (paid) or GEMINI_API_KEY_FREE + GEMINI_TIER=free.",
-    );
-  }
-  return createGoogleGenerativeAI({ apiKey });
+  if (!apiKey) throw new Error(`No ${tier} Gemini API key configured`);
+  return createGoogleGenerativeAI({ apiKey })("gemini-flash-lite-latest");
 }
 
 function groqClient() {
@@ -22,13 +26,9 @@ function groqClient() {
   return createGroq({ apiKey: e.GROQ_API_KEY });
 }
 
-/**
- * Main chat model. Default `gemini-flash-lite-latest` because it currently
- * has the best free-tier RPD allowance (500/day vs 20 for full Flash) while
- * still being smart enough for tool routing in this agent.
- */
+// Back-compat alias used by extractorModel.
 export function chatModel() {
-  return googleClient()("gemini-flash-lite-latest");
+  return chatModelForTier(hasFreeKey() ? "free" : "paid");
 }
 
 /**
