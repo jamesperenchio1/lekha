@@ -4,9 +4,14 @@ import { env } from "@/lib/env";
 
 function googleClient() {
   const e = env();
-  const apiKey = e.GEMINI_API_KEY ?? e.AI_GATEWAY_API_KEY;
+  const useFree = e.GEMINI_TIER === "free" && e.GEMINI_API_KEY_FREE;
+  const apiKey = useFree
+    ? e.GEMINI_API_KEY_FREE!
+    : (e.GEMINI_API_KEY ?? e.AI_GATEWAY_API_KEY);
   if (!apiKey) {
-    throw new Error("Missing GEMINI_API_KEY (or AI_GATEWAY_API_KEY) for LLM provider");
+    throw new Error(
+      "Missing API key. Set GEMINI_API_KEY (paid) or GEMINI_API_KEY_FREE + GEMINI_TIER=free.",
+    );
   }
   return createGoogleGenerativeAI({ apiKey });
 }
